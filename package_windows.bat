@@ -12,8 +12,6 @@ if not exist release\rtx30_40\slimecore_gpu.dll (
 )
 
 set "NATIVE_ARGS=--add-binary=slimecore.dll;. --add-binary=release\rtx30_40\slimecore_gpu.dll;. --add-data=color_card;."
-if exist cubiomes.dll set "NATIVE_ARGS=%NATIVE_ARGS% --add-binary=cubiomes.dll;."
-if exist libwinpthread-1.dll set "NATIVE_ARGS=%NATIVE_ARGS% --add-binary=libwinpthread-1.dll;."
 
 python -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --name SlimeFinder_RTX30_40 %NATIVE_ARGS% SlimeFinder.py

@@ -129,7 +129,7 @@ Minecraft 的史莱姆区块判定最终依赖 Java 48 位 LCG 和 `nextInt(10)`
 95a2776bcef5a04639ada1489076fb37b7e238543c3e12c3727b0e743f83d4af
 ```
 
-这说明优化改变了数据流，没有改变搜索结果。详细测试方法见 [GPU benchmark](docs/BENCHMARK.md)。
+这说明优化改变了数据流，没有改变搜索结果。
 
 ## GPU 实现
 
@@ -208,20 +208,10 @@ GTX 10 系使用 CUDA 12.x 单独构建：
 - 半径 500,000 时的总命中数及完整 Top-K 排序缓冲哈希；
 - 投影保存与重载，包括正负坐标、奇偶和矩形尺寸、负尺寸区域、方块实体及普通实体。
 
-可运行 GPU 对拍与交错基准：
-
-```powershell
-python .\tools\benchmark_gpu.py --radius 80000 --threshold 45 --cycles 3
-```
-
-投影回归测试：
-
-```powershell
-python .\tools\test_projection.py
-```
-
 ## 开源与第三方组件
 
-第三方组件和参考实现见 [THIRD_PARTY.md](THIRD_PARTY.md)。
+V34 CUDA 核心是针对本项目结果定义编写的独立实现。开发过程中参考了 NVIDIA CUDA Programming Guide，以及 `EDDxample/cuda-slime-finder`、`minelogy-dev/slime-calculator`、`silversquirl/slimy` 和 `CITYWIDESIGN/SlimeRadar` 中公开的通用算法方向，没有直接复制这些项目的源代码。
+
+运行依赖包括 PyQt6、litemapy、nbtlib、NVIDIA CUDA Runtime 和 Microsoft Visual C++ Runtime。`cubiomes.dll` 只用于可选群系检查，不包含在公开源码或 Release EXE 中。
 
 当前仓库尚未选择开源许可证。正式公开发布前请添加明确的许可证；在此之前，默认不授予复制、修改或再分发代码的权利。

@@ -26,6 +26,14 @@ assets/covers_cache/
 *.litematic
 color_card
 
+# Local development material not needed by end users
+.github/
+docs/
+tools/
+CONTRIBUTING.md
+THIRD_PARTY.md
+requirements-dev.txt
+
 # Local experiment/legacy snapshots (V34 is the publishable entry point)
 Slime_v2_migrated_v30.py
 Slime_v2_migrated_v31.py
