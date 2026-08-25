@@ -1,6 +1,7 @@
 # Native and packaged build outputs
 *.dll
 *.exe
+*.bat
 *.exp
 *.lib
 *.obj

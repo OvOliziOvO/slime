@@ -169,31 +169,29 @@ $env:SLIME_GPU_V34_RNG = "native"  # native / limb32 / truncated
 - `SlimeFinder_GTX1080.exe`：包含 `sm_61 + compute_61 PTX`，用于 GTX 10 系。
 - `SlimeFinder_RTX30_40.exe`：包含 `sm_86 + sm_89 + compute_89 PTX`，用于 RTX 30/40 系；更新架构可通过 PTX 前向兼容运行，但仍建议在目标显卡上实测。
 
-## 从源码运行
+## 下载与使用
 
-安装 Python 依赖：
+普通用户请从 [Releases](https://github.com/gmx201009-code/slime/releases/latest) 下载与显卡对应的 EXE：
+
+- GTX 10 系选择 `SlimeFinder_GTX1080.exe`。
+- RTX 30/40 系选择 `SlimeFinder_RTX30_40.exe`；更新架构通过 PTX 前向兼容运行。
+
+仓库只保留算法源文件和 Python 前端代码，不包含本地构建脚本或编译产物：
+
+- `SlimeCoreGPU.cu`：CUDA 搜索、精确圆形计数和设备短测。
+- `SlimeCore.cpp`：AVX2/OpenMP CPU 搜索核心。
+- `SlimeFinder.py`：PyQt6 前端、结果处理和投影导出。
+
+需要从源码运行时，先安装依赖：
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-构建 CPU 和 GPU 核心：
-
-```powershell
-.\build_cpu_x64.bat
-.\build_gpu_x64.bat
-```
-
-启动：
+然后使用 Visual Studio C++ 与 CUDA Toolkit 将两个核心分别编译为 `slimecore.dll` 和 `slimecore_gpu.dll`，放到 `SlimeFinder.py` 同一目录后启动：
 
 ```powershell
 python .\SlimeFinder.py
-```
-
-GTX 10 系使用 CUDA 12.x 单独构建：
-
-```powershell
-.\build_gpu_gtx1080_x64.bat
 ```
 
 `cubiomes.dll` 只用于可选的群系检查。没有它时，史莱姆区块搜索仍可正常运行，但相关群系功能不可用。
