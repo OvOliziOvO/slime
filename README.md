@@ -1,5 +1,7 @@
 # Slime Finder V1
 
+(AI写的 当参考即可)
+
 一个面向 Minecraft Java Edition 的高性能史莱姆区块聚集搜索器。它可以在大范围地图中寻找史莱姆区块最密集的位置，并提供图形界面、CPU/CUDA 双后端、AFK/Y 轴复核、搜索历史和 Litematica 投影导出。
 
 项目使用精确的 Java LCG 和圆形统计规则，不依赖抽样或概率近似。GPU 与 CPU 版本得到的是同一种结果，区别只在计算方式和速度。
