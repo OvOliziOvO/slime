@@ -1,0 +1,42 @@
+# Native and packaged build outputs
+*.dll
+*.exe
+*.exp
+*.lib
+*.obj
+*.pdb
+*.cubin
+*.ptx
+build/
+dist/
+*.spec
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# User state and generated artifacts
+settings.json
+history/
+images/
+data/
+assets/covers_cache/
+*.litematic
+color_card
+
+# Local experiment/legacy snapshots (V34 is the publishable entry point)
+Slime_v2_migrated_v30.py
+Slime_v2_migrated_v31.py
+Slime_v2_migrated_v32.py
+*_profile.*
+*_backup.*
+*_17bit.*
+
+# IDE and OS metadata
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
