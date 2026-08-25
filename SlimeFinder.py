@@ -80,7 +80,7 @@ class Myreg(Region):
         return root
 
 FILTER_MUSHROOM_ISLAND = True
-APP_VERSION = "V34"
+APP_VERSION = "V1"
 Y_PACK_SHIFT = 20
 Y_PACK_MASK = (1 << Y_PACK_SHIFT) - 1
 Y_PACK_BIAS = 1024
@@ -694,7 +694,7 @@ GPU_DRIVER_MSG = "未检测到 CUDA 驱动。"
 GPU_AVAILABLE = False
 GPU_STATUS_MSG = "GPU 算法未检测。"
 GPU_DEVICE_COUNT = None
-GPU_V34_ALGORITHM = "V34 方形滚动 + 角落差分精确圆形 + 全局 Top-K"
+GPU_V34_ALGORITHM = "GPU 方形滚动 + 角落差分精确圆形 + 全局 Top-K"
 
 def detect_cuda_driver():
     """Detect the NVIDIA CUDA driver without starting a heavy GPU scan.

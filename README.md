@@ -1,4 +1,4 @@
-# Slime Finder
+# Slime Finder V1
 
 一个面向 Minecraft Java Edition 的高性能史莱姆区块聚集搜索器。它可以在大范围地图中寻找史莱姆区块最密集的位置，并提供图形界面、CPU/CUDA 双后端、AFK/Y 轴复核、搜索历史和 Litematica 投影导出。
 
@@ -164,17 +164,11 @@ $env:SLIME_GPU_V34_RNG = "native"  # native / limb32 / truncated
 - GPU 模式：支持 CUDA 的 NVIDIA 显卡和相应驱动
 - 编译源码：Visual Studio C++ Build Tools 与 NVIDIA CUDA Toolkit
 
-发布构建分为两套：
-
-- `SlimeFinder_GTX1080.exe`：包含 `sm_61 + compute_61 PTX`，用于 GTX 10 系。
-- `SlimeFinder_RTX30_40.exe`：包含 `sm_86 + sm_89 + compute_89 PTX`，用于 RTX 30/40 系；更新架构可通过 PTX 前向兼容运行，但仍建议在目标显卡上实测。
+V1 使用一个统一发行包 `SlimeFinder_NVIDIA_10_50.exe`，包含 GTX 10、RTX 20、RTX 30、RTX 40、RTX 50 系对应的 `sm_61`、`sm_75`、`sm_86`、`sm_89`、`sm_120` 原生代码，并保留 PTX 回退。不同显卡会在运行时自动短测线程形状和 RNG 路径。
 
 ## 下载与使用
 
-普通用户请从 [Releases](https://github.com/gmx201009-code/slime/releases/latest) 下载与显卡对应的 EXE：
-
-- GTX 10 系选择 `SlimeFinder_GTX1080.exe`。
-- RTX 30/40 系选择 `SlimeFinder_RTX30_40.exe`；更新架构通过 PTX 前向兼容运行。
+普通用户请从 [Releases](https://github.com/gmx201009-code/slime/releases/latest) 下载 `SlimeFinder_NVIDIA_10_50.exe`。一个文件覆盖 GTX 10 到 RTX 50 系，无需手动选择架构版本。
 
 仓库只保留算法源文件和 Python 前端代码，不包含本地构建脚本或编译产物：
 
@@ -208,7 +202,7 @@ python .\SlimeFinder.py
 
 ## 开源与第三方组件
 
-V34 CUDA 核心是针对本项目结果定义编写的独立实现。开发过程中参考了 NVIDIA CUDA Programming Guide，以及 `EDDxample/cuda-slime-finder`、`minelogy-dev/slime-calculator`、`silversquirl/slimy` 和 `CITYWIDESIGN/SlimeRadar` 中公开的通用算法方向，没有直接复制这些项目的源代码。
+V1 CUDA 核心是针对本项目结果定义编写的独立实现。开发过程中参考了 NVIDIA CUDA Programming Guide，以及 `EDDxample/cuda-slime-finder`、`minelogy-dev/slime-calculator`、`silversquirl/slimy` 和 `CITYWIDESIGN/SlimeRadar` 中公开的通用算法方向，没有直接复制这些项目的源代码。
 
 运行依赖包括 PyQt6、litemapy、nbtlib、NVIDIA CUDA Runtime 和 Microsoft Visual C++ Runtime。`cubiomes.dll` 只用于可选群系检查，不包含在公开源码或 Release EXE 中。
 
