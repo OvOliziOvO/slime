@@ -3901,6 +3901,69 @@ class SlimeApp(QWidget):
         y = self.current_afk_y if mode == "main" and self.current_afk_y is not None else "~"
         QApplication.clipboard().setText(f"/tp @s {p[0]} {y} {p[1]}")
 
+    def _confirm_low_scale_large_search(self, min_size, radius):
+        """One-time three-step warning for very broad low-threshold searches."""
+        if min_size >= 40 or radius <= 10000:
+            return True
+
+        flag_path = os.path.join(APP_DIR, "data", "low_scale_search_warning_acknowledged.txt")
+        if os.path.exists(flag_path):
+            return True
+
+        first = QMessageBox(self)
+        first.setIcon(QMessageBox.Icon.Warning)
+        first.setWindowTitle("先提醒一下")
+        first.setText(
+            "当前最小规模低于 40。\n\n"
+            "这种条件会产生非常多的候选结果，真正耗时的部分可能不再是 GPU 扫描，"
+            "而是后续的结果整理、排名和精准比对。"
+        )
+        continue_1 = first.addButton("我知道了，继续", QMessageBox.ButtonRole.AcceptRole)
+        first.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        first.exec()
+        if first.clickedButton() is not continue_1:
+            return False
+
+        second = QMessageBox(self)
+        second.setIcon(QMessageBox.Icon.Question)
+        second.setWindowTitle("你真的确定吗？")
+        second.setText(
+            f"你现在的搜索半径是 {radius:,}。\n\n"
+            "范围越大，低规模条件产生的候选数量就可能越夸张，"
+            "最后的比对和排名时间也会跟着变长。\n\n"
+            "你真的确定要这样搜吗？"
+        )
+        continue_2 = second.addButton("确定，继续", QMessageBox.ButtonRole.AcceptRole)
+        second.addButton("我再想想", QMessageBox.ButtonRole.RejectRole)
+        second.exec()
+        if second.clickedButton() is not continue_2:
+            return False
+
+        third = QMessageBox(self)
+        third.setIcon(QMessageBox.Icon.Information)
+        third.setWindowTitle("好吧……")
+        third.setText(
+            "好吧，你执意如此。\n\n"
+            "那就开始吧。以后只要确认文件还在，这三段提示就不会再出现；"
+            "如果哪天想把它们找回来，删除那个确认文件即可。"
+        )
+        start_btn = third.addButton("开始搜索", QMessageBox.ButtonRole.AcceptRole)
+        third.addButton("算了", QMessageBox.ButtonRole.RejectRole)
+        third.exec()
+        if third.clickedButton() is not start_btn:
+            return False
+
+        try:
+            os.makedirs(os.path.dirname(flag_path), exist_ok=True)
+            with open(flag_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "Low-scale large-radius search warning acknowledged.\n"
+                    "Delete this file to show the three-step warning again.\n"
+                )
+        except Exception as e:
+            self.upd_log(f"无法保存低规模搜索确认标记，下次仍会提示: {e}")
+        return True
+
     def start_work(self):
         seed_text = self.seed_text_edit.toPlainText().strip()
         if not seed_text:
@@ -3923,6 +3986,8 @@ class SlimeApp(QWidget):
                 raise ValueError("最小规模必须大于 0。")
             if self.config.use_range and max_s < ms:
                 raise ValueError("最大规模不能小于最小规模。")
+            if not self._confirm_low_scale_large_search(ms, rd_max):
+                return
             self.config.min_size = ms
             self.config.max_size = max_s
             self.config.last_seed = seed_text
