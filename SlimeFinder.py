@@ -1,6 +1,5 @@
 import sys
 import os
-import shutil
 import threading
 import time
 import glob
@@ -13,8 +12,8 @@ import atexit
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PyQt6.QtWidgets import *
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QSize, QPropertyAnimation, QPointF
-from PyQt6.QtGui import QPixmap, QPixmapCache, QKeySequence, QShortcut, QImage, QPainter, QColor, QPen, QAction, QIcon, QPainterPath, QPolygonF
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QSize, QPropertyAnimation, QPointF, QUrl
+from PyQt6.QtGui import QPixmap, QPixmapCache, QKeySequence, QShortcut, QImage, QPainter, QColor, QPen, QAction, QIcon, QPainterPath, QPolygonF, QFont, QDesktopServices
 
 try:
     from litemapy import Schematic, Region, BlockState
@@ -27,31 +26,45 @@ except ImportError:
 
 FILTER_MUSHROOM_ISLAND = True
 APP_VERSION = "V1"
+MAX_CANDIDATE_BUFFER = 3_000_000
+MAX_SEARCH_RADIUS = (2_147_483_647 - 17) // 2
+WORLD_BORDER_RADIUS_CHUNKS = 1_875_000
+DEFAULT_MC_VERSION = "1.21.11"
+SUPPORTED_MC_VERSIONS = (
+    "1.19", "1.20", "1.21.1", "1.21.3", "1.21.4",
+    "1.21.5", "1.21.6", "1.21.9", "1.21.11", "26.1", "26.2",
+)
+CUBIOMES_GENERATOR_BUFFER_SIZE = 256 * 1024
+CUBIOMES_DOWNLOAD_URL = "https://github.com/Conflux-Union/cubiomes"
 Y_PACK_SHIFT = 20
 Y_PACK_MASK = (1 << Y_PACK_SHIFT) - 1
 Y_PACK_BIAS = 1024
 DEFAULT_RESULT_LIMIT = 50
 MAX_RESULT_LIMIT = 1000
-TOP_RESULT_LIMIT = DEFAULT_RESULT_LIMIT  # legacy fallback for old settings/history
+
+# ===== 投影 =====
+PROJECTION_MAX_SIZE = 1024
 SPAWN_INNER_RADIUS = 24
 SPAWN_OUTER_RADIUS = 128
 SPAWN_INNER_SQ = SPAWN_INNER_RADIUS * SPAWN_INNER_RADIUS
 SPAWN_OUTER_SQ = SPAWN_OUTER_RADIUS * SPAWN_OUTER_RADIUS
 
-def is_spawnable_floor_block(afk_x, afk_z, block_x, block_z, is_slime_chunk_at):
-    """Return True for blocks that can actually be slime spawn floor.
-
-    Minecraft's spawn sphere excludes blocks at distance <= 24 and includes
-    blocks at distance <= 128. The old floor code accidentally included the
-    exact 24-block ring and excluded the exact 128-block ring.
-    """
-    dist_sq = (int(block_x) - int(afk_x)) ** 2 + (int(block_z) - int(afk_z)) ** 2
+def is_spawnable_floor_block(
+        afk_x, afk_z, block_x, block_z, is_slime_chunk_at,
+        afk_y=-64, platform_y=-64):
+    dy = int(platform_y) - int(afk_y)
+    dist_sq = (
+        (int(block_x) - int(afk_x)) ** 2
+        + (int(block_z) - int(afk_z)) ** 2
+        + dy * dy
+    )
     if dist_sq <= SPAWN_INNER_SQ or dist_sq > SPAWN_OUTER_SQ:
         return False
     return bool(is_slime_chunk_at(int(block_x) >> 4, int(block_z) >> 4))
 
-def build_floor_distance_field(afk_x, afk_z, width, length, is_slime_chunk_at, distance_limit=4):
-    """Build the shared Chebyshev distance field used by preview and export."""
+def build_floor_distance_field(
+        afk_x, afk_z, width, length, is_slime_chunk_at, distance_limit=4,
+        afk_y=-64, platform_y=-64):
     width = int(width)
     length = int(length)
     origin_x = -(width // 2)
@@ -64,7 +77,9 @@ def build_floor_distance_field(afk_x, afk_z, width, length, is_slime_chunk_at, d
         wx = start_x + x
         row_offset = x * length
         for z in range(length):
-            if is_spawnable_floor_block(afk_x, afk_z, wx, start_z + z, is_slime_chunk_at):
+            if is_spawnable_floor_block(
+                    afk_x, afk_z, wx, start_z + z, is_slime_chunk_at,
+                    afk_y=afk_y, platform_y=platform_y):
                 distance_field[row_offset + z] = 0
 
     for x in range(width):
@@ -130,12 +145,23 @@ def ensure_litematic_extension(path):
     path = str(path)
     return path if path.lower().endswith(".litematic") else path + ".litematic"
 
+def validate_projection_dimensions(width, length):
+    try:
+        width, length = int(width), int(length)
+    except (TypeError, ValueError):
+        raise ValueError("总宽度和总长度必须是整数。")
+    if width < 16 or length < 16:
+        raise ValueError("总宽度和总长度必须至少为 16。")
+    if width > PROJECTION_MAX_SIZE or length > PROJECTION_MAX_SIZE:
+        raise ValueError(f"尺寸过大，最大支持 {PROJECTION_MAX_SIZE} x {PROJECTION_MAX_SIZE}。")
+    return width, length
+
 def create_slime_floor_schematic(
         active_seed, afk_x, afk_z, width, length, floor_block_id,
         use_magma=True, use_wither=True, use_rod=True,
         use_portal_array=True, portal_axis_x=True,
-        wither_base_soul=False, slime_chunk_at=None):
-    """Create a floor schematic without UI state, so it can be round-trip tested."""
+        wither_base_soul=False, slime_chunk_at=None,
+        afk_y=-64, platform_y=-64):
     if not HAS_LITEMAPY:
         raise RuntimeError("需要安装环境 litemapy")
     width, length = int(width), int(length)
@@ -166,7 +192,8 @@ def create_slime_floor_schematic(
         return chunk_cache[key]
 
     _, _, start_x, start_z, distance_field = build_floor_distance_field(
-        afk_x, afk_z, width, length, is_slime_cached)
+        afk_x, afk_z, width, length, is_slime_cached,
+        afk_y=afk_y, platform_y=platform_y)
 
     for x in range(width):
         wx = start_x + x
@@ -197,14 +224,12 @@ def create_slime_floor_schematic(
                 floor[(x, 0, z)] = floor_block
     return schem
 
-# Chunks that may contribute spawning spaces around a candidate AFK point.
-# Precompute per-block-local-position overlap counts so precise comparison does
-# ~200 chunk checks per candidate instead of ~49,640 block checks.
+# ===== 精准评分 =====
+# 128 格范围与史莱姆聚类圆不是同一套几何，外围区块也必须参与评分。
 SPAWNABLE_CHUNK_REL_OFFSETS = tuple(
     (dcx, dcz)
     for dcx in range(-8, 9)
     for dcz in range(-8, 9)
-    if dcx * dcx + dcz * dcz <= 68
 )
 
 def build_spawnable_overlap_table():
@@ -233,25 +258,34 @@ def build_spawnable_overlap_table():
 
 SPAWNABLE_CHUNK_OVERLAP = build_spawnable_overlap_table()
 
-def build_spawnable_upper_bound_table():
-    table = {}
-    for local_key, entries in SPAWNABLE_CHUNK_OVERLAP.items():
-        weights = sorted((int(entry[2]) for entry in entries), reverse=True)
-        prefix = [0]
-        for weight in weights:
-            prefix.append(prefix[-1] + weight)
-        table[local_key] = tuple(prefix)
-    return table
+# 严格上界，只用于安全剪枝。
+PRECISE_SPAWN_SAFE_BOUND = (
+    3701,3957,4213,4469,4725,4981,5237,5493,5749,6005,6261,6517,6773,7029,7285,7541,
+    7797,8053,8309,8565,8821,9077,9333,9589,9845,10101,10357,10613,10869,11125,11381,
+    11637,11893,12149,12405,12661,12917,13173,13429,13685,13941,14197,14453,14709,
+    14965,15221,15477,15733,15989,16245,16501,16757,17013,17269,17525,17781,18037,
+    18293,18549,18805,19061,19317,19573,19829,20085,20341,20597,20853,21109,21365,
+    21621,21877,22133,22389,22645,22901,23157,23413,23669,23925,24181,24437,24693,
+    24949,25205,25461,25717,25973,26229,26485,26741,26997,27253,27509,27765,28021,
+    28277,28533,28789,29045,29301,29557,29813,30069,30325,30581,30837,31093,31349,
+    31605,31861,32117,32373,32629,32885,33141,33397,33653,33909,34165,34421,34677,
+    34933,35189,35445,35701,35957,36213,36469,36725,36981,37237,37493,37749,38005,
+    38261,38517,38773,39029,39285,39541,39797,40053,40309,40565,40821,41077,41333,
+    41589,41845,42101,42357,42613,42869,43125,43381,43637,43893,44149,44405,44661,
+    44917,45172,45427,45660,45893,46119,46345,46566,46787,46972,47157,47340,47523,
+    47694,47865,47997,48115,48233,48346,48459,48564,48669,48772,48875,48978,49079,
+    49180,49275,49370,49425,49480,49531,49582,49600,49618,49626,49629,49632,49634,
+    49636,49637,49640,49640,49640,49640,49640,49640,49640,49640,49640,49640,49640,
+    49640,49640,49640,49640,49640,49640,49640,49640,49640,
+)
 
-SPAWNABLE_UPPER_BOUND = build_spawnable_upper_bound_table()
-
-def spawnable_upper_bound(local_key, slime_chunk_count):
-    try:
-        prefix = SPAWNABLE_UPPER_BOUND[local_key]
-        n = max(0, min(int(slime_chunk_count), len(prefix) - 1))
-        return prefix[n]
-    except Exception:
-        return max(0, int(slime_chunk_count) if str(slime_chunk_count).lstrip('-').isdigit() else 0) * 256
+# 扫描 Y 时使用独立的严格上界。
+PRECISE_Y_SPAWN_SAFE_BOUND = PRECISE_SPAWN_SAFE_BOUND[:182] + (
+    48694,48833,48929,49025,49100,49180,49275,49370,49425,49480,
+    49531,49593,49620,49647,49671,49695,49696,49696,49696,49696,
+    49696,49696,49696,49696,49696,49696,49696,49696,49696,49696,
+    49696,49696,49696,49696,49696,49696,49696,49696,49696,49696,
+)
 
 def clamp_int(value, default, min_value, max_value):
     try:
@@ -262,12 +296,6 @@ def clamp_int(value, default, min_value, max_value):
 
 
 def format_elapsed(seconds):
-    """Human readable elapsed time.
-
-    Keep sub-second / short-task precision because GPU scans can finish fast;
-    the old integer formatter turned 0.8s into "0秒", which made large scans
-    look suspicious or broken even when CUDA had actually synchronized.
-    """
     try:
         seconds = max(0.0, float(seconds))
     except Exception:
@@ -305,8 +333,6 @@ def precise_exhaustive_enabled(config=None):
     return value in ("1", "true", "yes", "on", "all")
 
 os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
-ORIGINAL_CWD = os.path.abspath(os.getcwd())
-ARG_DIR = os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv and sys.argv[0] else ORIGINAL_CWD
 
 if getattr(sys, 'frozen', False):
     RESOURCE_DIR = sys._MEIPASS
@@ -317,25 +343,16 @@ else:
     PACKAGE_DIR = os.path.dirname(RESOURCE_DIR) if os.path.basename(RESOURCE_DIR).lower() == "app" else RESOURCE_DIR
     APP_DIR = PACKAGE_DIR
 
-# Native DLLs may live beside the .py/.exe, in the launcher working directory,
-# or inside packaged release/runtime/native folders. Keep script dir first so V2
-# behaves like the original UI build, but still supports the V1 package layout.
+# ===== 资源与原生 DLL =====
 RESOURCE_SEARCH_DIRS = [
     RESOURCE_DIR,
     APP_DIR,
-    ORIGINAL_CWD,
-    ARG_DIR,
     PACKAGE_DIR,
     os.path.join(PACKAGE_DIR, "release"),
     os.path.join(PACKAGE_DIR, "runtime"),
     os.path.join(PACKAGE_DIR, "native", "cpu"),
     os.path.join(PACKAGE_DIR, "native", "gpu"),
-    os.path.join(APP_DIR, "release"),
-    os.path.join(APP_DIR, "runtime"),
-    os.path.join(APP_DIR, "native", "cpu"),
-    os.path.join(APP_DIR, "native", "gpu"),
     os.path.join(PACKAGE_DIR, "app"),
-    os.path.join(APP_DIR, "app"),
 ]
 
 
@@ -357,29 +374,7 @@ def _unique_existing_dirs(paths):
             out.append(p)
     return out
 
-try:
-    _CWD_AT_START = os.getcwd()
-except Exception:
-    _CWD_AT_START = APP_DIR
-
-RESOURCE_SEARCH_DIRS = _unique_existing_dirs(
-    RESOURCE_SEARCH_DIRS + [
-        APP_DIR,
-        RESOURCE_DIR,
-        PACKAGE_DIR,
-        _CWD_AT_START,
-        os.path.join(APP_DIR, "app"),
-        os.path.join(PACKAGE_DIR, "app"),
-        os.path.join(APP_DIR, "release"),
-        os.path.join(APP_DIR, "runtime"),
-        os.path.join(APP_DIR, "native", "cpu"),
-        os.path.join(APP_DIR, "native", "gpu"),
-        os.path.join(PACKAGE_DIR, "release"),
-        os.path.join(PACKAGE_DIR, "runtime"),
-        os.path.join(PACKAGE_DIR, "native", "cpu"),
-        os.path.join(PACKAGE_DIR, "native", "gpu"),
-    ]
-)
+RESOURCE_SEARCH_DIRS = _unique_existing_dirs(RESOURCE_SEARCH_DIRS)
 
 def find_resource(filename):
     for base_dir in RESOURCE_SEARCH_DIRS:
@@ -395,15 +390,8 @@ def searched_dirs_text(limit=10):
         text += "；另有 {} 个目录".format(len(RESOURCE_SEARCH_DIRS) - limit)
     return text
 
-try:
-    os.chdir(APP_DIR)
-except Exception:
-    pass
-
 _DLL_DIR_HANDLES = []
 _REGISTERED_DLL_DIRS = set()
-_LOADED_RUNTIME_DLLS = []
-_NATIVE_CACHE_DIR = None
 
 _PE_MACHINE_NAMES = {
     0x014c: "x86/32位",
@@ -431,15 +419,6 @@ def _describe_pe_arch(path):
     except Exception as e:
         return "无法读取架构: {}".format(e)
 
-def _prepend_to_path(dir_path):
-    if not sys.platform.startswith("win") or not dir_path or not os.path.isdir(dir_path):
-        return
-    current = os.environ.get("PATH", "")
-    parts = [p for p in current.split(os.pathsep) if p]
-    norm = os.path.normcase(os.path.abspath(dir_path))
-    if all(os.path.normcase(os.path.abspath(p)) != norm for p in parts if p):
-        os.environ["PATH"] = dir_path + os.pathsep + current
-
 def _register_dll_directory(dir_path):
     if not dir_path or not os.path.isdir(dir_path):
         return
@@ -448,89 +427,20 @@ def _register_dll_directory(dir_path):
     if key in _REGISTERED_DLL_DIRS:
         return
     _REGISTERED_DLL_DIRS.add(key)
-    _prepend_to_path(dir_path)
     if hasattr(os, "add_dll_directory"):
-        try:
-            _DLL_DIR_HANDLES.append(os.add_dll_directory(dir_path))
-        except Exception:
-            pass
+        _DLL_DIR_HANDLES.append(os.add_dll_directory(dir_path))
 
 for _dll_dir in RESOURCE_SEARCH_DIRS:
     _register_dll_directory(_dll_dir)
 
 
-def _ctypes_load(path, winmode=None):
-    if sys.platform.startswith("win") and winmode is not None:
+def _ctypes_load(path):
+    if sys.platform.startswith("win"):
         try:
-            return ctypes.CDLL(path, winmode=winmode)
+            return ctypes.CDLL(path, winmode=0x00000100 | 0x00001000)
         except TypeError:
             return ctypes.CDLL(path)
     return ctypes.CDLL(path)
-
-def _runtime_candidates():
-    return (
-        "libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll",
-        "zlib1.dll", "zlib.dll", "vcruntime140.dll", "vcruntime140_1.dll",
-        "msvcp140.dll", "msvcp140_1.dll", "concrt140.dll"
-    )
-
-def _preload_common_runtime_dlls(extra_dirs=()):
-    if not sys.platform.startswith("win"):
-        return
-    search_dirs = _unique_existing_dirs(list(extra_dirs) + RESOURCE_SEARCH_DIRS)
-    for name in _runtime_candidates():
-        for base in search_dirs:
-            p = os.path.join(base, name)
-            if not os.path.exists(p):
-                continue
-            try:
-                _LOADED_RUNTIME_DLLS.append(_ctypes_load(p, 0x00000008))  # LOAD_WITH_ALTERED_SEARCH_PATH
-                break
-            except Exception:
-                try:
-                    _LOADED_RUNTIME_DLLS.append(_ctypes_load(p))
-                    break
-                except Exception:
-                    pass
-
-def _copy_native_dlls_to_ascii_cache(target_path):
-    """Fallback for Chinese/space-heavy paths and dependency search problems.
-    Copies local DLLs into an ASCII temp folder, then loads from there.
-    """
-    if not sys.platform.startswith("win"):
-        return None
-    try:
-        import hashlib
-        import tempfile
-        global _NATIVE_CACHE_DIR
-        roots = _unique_existing_dirs(RESOURCE_SEARCH_DIRS + [os.path.dirname(os.path.abspath(target_path))])
-        key_src = ("|".join(roots) + "|" + os.path.abspath(target_path)).encode("utf-8", "ignore")
-        cache_dir = os.path.join(tempfile.gettempdir(), "slime_native_cache_" + hashlib.md5(key_src).hexdigest()[:12])
-        os.makedirs(cache_dir, exist_ok=True)
-        _NATIVE_CACHE_DIR = cache_dir
-        for base in roots:
-            try:
-                names = os.listdir(base)
-            except Exception:
-                continue
-            for name in names:
-                if not name.lower().endswith(".dll"):
-                    continue
-                src = os.path.join(base, name)
-                dst = os.path.join(cache_dir, name)
-                try:
-                    need_copy = (not os.path.exists(dst) or
-                                 os.path.getsize(dst) != os.path.getsize(src) or
-                                 int(os.path.getmtime(dst)) < int(os.path.getmtime(src)))
-                    if need_copy:
-                        shutil.copy2(src, dst)
-                except Exception:
-                    # If an old cached DLL exists, it may still be usable.
-                    pass
-        cached_target = os.path.join(cache_dir, os.path.basename(target_path))
-        return cached_target if os.path.exists(cached_target) else None
-    except Exception:
-        return None
 
 def _format_native_load_error(path, errors):
     info = []
@@ -543,8 +453,6 @@ def _format_native_load_error(path, errors):
             pass
         info.append("DLL架构: {}".format(_describe_pe_arch(path)))
     info.append("Python架构: {}".format(_python_arch_text()))
-    if _NATIVE_CACHE_DIR:
-        info.append("临时DLL缓存: {}".format(_NATIVE_CACHE_DIR))
     info.append("搜索目录: {}".format(searched_dirs_text()))
     if errors:
         info.append("加载尝试:")
@@ -561,42 +469,10 @@ def load_native_library(path):
     dll_dir = os.path.dirname(path)
     for d in [dll_dir] + RESOURCE_SEARCH_DIRS:
         _register_dll_directory(d)
-    _preload_common_runtime_dlls([dll_dir])
-
-    if sys.platform.startswith("win"):
-        try:
-            ctypes.windll.kernel32.SetDllDirectoryW(dll_dir)
-        except Exception:
-            pass
-
-    attempts = [
-        ("默认", None),
-        ("LOAD_WITH_ALTERED_SEARCH_PATH", 0x00000008),
-        ("LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|DEFAULT_DIRS", 0x00000100 | 0x00001000),
-    ]
-    errors = []
-    for label, mode in attempts:
-        try:
-            return _ctypes_load(path, mode)
-        except Exception as e:
-            errors.append("{}: {}: {}".format(label, type(e).__name__, e))
-
-    cached_path = _copy_native_dlls_to_ascii_cache(path)
-    if cached_path and os.path.normcase(os.path.abspath(cached_path)) != os.path.normcase(path):
-        cache_dir = os.path.dirname(cached_path)
-        _register_dll_directory(cache_dir)
-        _preload_common_runtime_dlls([cache_dir])
-        try:
-            ctypes.windll.kernel32.SetDllDirectoryW(cache_dir)
-        except Exception:
-            pass
-        for label, mode in attempts:
-            try:
-                return _ctypes_load(cached_path, mode)
-            except Exception as e:
-                errors.append("缓存{}: {}: {}".format(label, type(e).__name__, e))
-
-    raise OSError(_format_native_load_error(path, errors))
+    try:
+        return _ctypes_load(path)
+    except Exception as e:
+        raise OSError(_format_native_load_error(path, [f"{type(e).__name__}: {e}"])) from e
 
 class CubiomesPos(ctypes.Structure):
     _fields_ = [("x", ctypes.c_int32), ("z", ctypes.c_int32)]
@@ -613,6 +489,12 @@ else:
         cb.applySeed.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64]
         cb.getBiomeAt.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         cb.getBiomeAt.restype = ctypes.c_int
+        if hasattr(cb, "str2mc"):
+            cb.str2mc.argtypes = [ctypes.c_char_p]
+            cb.str2mc.restype = ctypes.c_int
+        if hasattr(cb, "mc2str"):
+            cb.mc2str.argtypes = [ctypes.c_int]
+            cb.mc2str.restype = ctypes.c_char_p
         if hasattr(cb, "getSpawn"):
             cb.getSpawn.argtypes = [ctypes.c_void_p]
             cb.getSpawn.restype = CubiomesPos
@@ -626,45 +508,14 @@ class ExtChunkResult(ctypes.Structure):
         ("obs_count", ctypes.c_int32), ("afk_x", ctypes.c_int32), ("afk_z", ctypes.c_int32)
     ]
 
-GPU_DRIVER_AVAILABLE = False
-GPU_DRIVER_MSG = "未检测到 CUDA 驱动。"
 GPU_AVAILABLE = False
 GPU_STATUS_MSG = "GPU 算法未检测。"
-GPU_DEVICE_COUNT = None
+GPU_DEVICE_COUNT = 0
 GPU_DEVICE_NAME = "NVIDIA GPU"
-GPU_V34_ALGORITHM = "GPU 方形滚动 + 角落差分精确圆形 + 全局 Top-K"
-
-def detect_cuda_driver():
-    """Detect the NVIDIA CUDA driver without starting a heavy GPU scan.
-
-    Loading slimecore_gpu.dll only proves the CUDA runtime DLL is available. On
-    some machines it can still fail later because the NVIDIA driver is missing
-    or too old. Auto mode should prefer GPU only when the driver is visible.
-    """
-    force = os.environ.get("SLIME_FORCE_GPU", "").strip().lower()
-    if force in ("1", "true", "yes", "on"):
-        return True, "环境变量 SLIME_FORCE_GPU 已强制启用 GPU。"
-
-    if sys.platform.startswith("win"):
-        candidates = ("nvcuda.dll",)
-    elif sys.platform == "darwin":
-        candidates = ("libcuda.dylib",)
-    else:
-        candidates = ("libcuda.so.1", "libcuda.so")
-
-    errors = []
-    for name in candidates:
-        try:
-            ctypes.CDLL(name)
-            return True, f"检测到 CUDA 驱动：{name}。"
-        except OSError as e:
-            errors.append(f"{name}: {e}")
-        except Exception as e:
-            errors.append(f"{name}: {e}")
-    return False, "未检测到 CUDA 驱动；" + ("；".join(errors[:2]) if errors else "未找到驱动库。")
+GPU_V1_ALGORITHM = "V1 GPU 方形滚动 + 角落差分精确圆形 + 全局 Top-K"
 
 def cpu_algorithm_available():
-    return bool(sc_cpu_lib and hasattr(sc_cpu_lib, "search_slime_clusters"))
+    return sc_cpu_lib is not None
 
 def gpu_algorithm_available():
     return bool(sc_gpu_lib and GPU_AVAILABLE)
@@ -690,8 +541,6 @@ def resolve_engine_choice(choice):
         return "CPU (AVX2/OpenMP)", "Auto：未检测到可用 GPU，使用 CPU 原生算法。"
     return "Python", "Auto：GPU/CPU 原生算法都不可用，自动启用隐藏的 Python 后备模式。"
 
-GPU_DRIVER_AVAILABLE, GPU_DRIVER_MSG = detect_cuda_driver()
-
 sc_cpu_lib = None
 sc_gpu_lib = None
 is_slime_chunk_fast = None
@@ -704,38 +553,27 @@ if not os.path.exists(CPU_DLL):
 else:
     try:
         _cpu = load_native_library(CPU_DLL)
-        # Do not count the file as available unless the main entry point is really exported.
-        _cpu.search_slime_clusters.argtypes = [
+        _cpu.search_slime_clusters_centered.argtypes = [
             ctypes.c_int64, ctypes.c_int64, ctypes.c_int32, ctypes.c_int32,
-            ctypes.c_int64, ctypes.POINTER(ExtChunkResult), ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
-        _cpu.search_slime_clusters.restype = ctypes.c_int64
-        if hasattr(_cpu, "search_slime_clusters_centered"):
-            _cpu.search_slime_clusters_centered.argtypes = [
-                ctypes.c_int64, ctypes.c_int64, ctypes.c_int32, ctypes.c_int32,
-                ctypes.c_int64, ctypes.c_int32, ctypes.c_int32,
-                ctypes.POINTER(ExtChunkResult), ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
-            _cpu.search_slime_clusters_centered.restype = ctypes.c_int64
+            ctypes.c_int64, ctypes.c_int32, ctypes.c_int32,
+            ctypes.POINTER(ExtChunkResult), ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
+        _cpu.search_slime_clusters_centered.restype = ctypes.c_int64
 
         if hasattr(_cpu, "is_slime_chunk_c"):
             _cpu.is_slime_chunk_c.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
             _cpu.is_slime_chunk_c.restype = ctypes.c_bool
             is_slime_chunk_fast = _cpu.is_slime_chunk_c
         for func in ["request_cancel", "reset_cancel", "request_pause", "resume_search"]:
-            if hasattr(_cpu, func):
-                getattr(_cpu, func).argtypes = []
-                getattr(_cpu, func).restype = None
-        if hasattr(_cpu, "set_y_scan_config"):
-            _cpu.set_y_scan_config.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
-            _cpu.set_y_scan_config.restype = None
-        if hasattr(_cpu, "refine_candidates_y"):
-            _cpu.refine_candidates_y.argtypes = [ctypes.c_int64, ctypes.POINTER(ExtChunkResult), ctypes.c_int32, ctypes.c_int32]
-            _cpu.refine_candidates_y.restype = None
-        if hasattr(_cpu, "score_candidates_precise"):
-            _cpu.score_candidates_precise.argtypes = [ctypes.c_int64, ctypes.POINTER(ExtChunkResult), ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
-            _cpu.score_candidates_precise.restype = None
-        if hasattr(_cpu, "get_progress"):
-            _cpu.get_progress.argtypes = []
-            _cpu.get_progress.restype = ctypes.c_int32
+            getattr(_cpu, func).argtypes = []
+            getattr(_cpu, func).restype = None
+        _cpu.set_y_scan_config.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
+        _cpu.set_y_scan_config.restype = None
+        _cpu.refine_candidates_y.argtypes = [ctypes.c_int64, ctypes.POINTER(ExtChunkResult), ctypes.c_int32, ctypes.c_int32]
+        _cpu.refine_candidates_y.restype = None
+        _cpu.score_candidates_precise.argtypes = [ctypes.c_int64, ctypes.POINTER(ExtChunkResult), ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
+        _cpu.score_candidates_precise.restype = None
+        _cpu.get_progress.argtypes = []
+        _cpu.get_progress.restype = ctypes.c_int32
         sc_cpu_lib = _cpu
         CPU_STATUS_MSG = f"CPU 原生算法可用: {CPU_DLL}"
     except Exception as e:
@@ -750,77 +588,57 @@ GPU_DLL = find_resource("slimecore_gpu.dll")
 if os.path.exists(GPU_DLL):
     try:
         sc_gpu_lib = load_native_library(GPU_DLL)
-        sc_gpu_lib.search_slime_clusters_gpu_v34.argtypes = [
-            ctypes.c_int64, ctypes.c_int64, ctypes.c_int32, ctypes.c_int32,
-            ctypes.c_int64, ctypes.POINTER(ExtChunkResult), ctypes.c_int32, ctypes.c_int32]
-        sc_gpu_lib.search_slime_clusters_gpu_v34.restype = ctypes.c_int64
-        if hasattr(sc_gpu_lib, "search_slime_clusters_gpu_v34_centered"):
-            sc_gpu_lib.search_slime_clusters_gpu_v34_centered.argtypes = [
-                ctypes.c_int64, ctypes.c_int64, ctypes.c_int32, ctypes.c_int32,
-                ctypes.c_int64, ctypes.c_int32, ctypes.c_int32,
-                ctypes.POINTER(ExtChunkResult), ctypes.c_int32, ctypes.c_int32]
-            sc_gpu_lib.search_slime_clusters_gpu_v34_centered.restype = ctypes.c_int64
+        for name in ("search_slime_clusters_gpu_v1_centered", "search_slime_clusters_gpu_v34_centered"):
+            if hasattr(sc_gpu_lib, name):
+                fn = getattr(sc_gpu_lib, name)
+                fn.argtypes = [
+                    ctypes.c_int64, ctypes.c_int64, ctypes.c_int32, ctypes.c_int32,
+                    ctypes.c_int64, ctypes.c_int32, ctypes.c_int32,
+                    ctypes.POINTER(ExtChunkResult), ctypes.c_int32, ctypes.c_int32]
+                fn.restype = ctypes.c_int64
 
         if hasattr(sc_gpu_lib, "is_slime_chunk_c"):
             sc_gpu_lib.is_slime_chunk_c.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
             sc_gpu_lib.is_slime_chunk_c.restype = ctypes.c_bool
             if not is_slime_chunk_fast: is_slime_chunk_fast = sc_gpu_lib.is_slime_chunk_c
         for func in ["request_cancel", "reset_cancel", "request_pause", "resume_search", "cleanup_gpu_resources"]:
-            if hasattr(sc_gpu_lib, func): getattr(sc_gpu_lib, func).argtypes = []; getattr(sc_gpu_lib, func).restype = None
-        if hasattr(sc_gpu_lib, "set_y_scan_config"):
-            sc_gpu_lib.set_y_scan_config.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
-            sc_gpu_lib.set_y_scan_config.restype = None
-        if hasattr(sc_gpu_lib, "refine_candidates_y"):
-            sc_gpu_lib.refine_candidates_y.argtypes = [ctypes.c_int64, ctypes.POINTER(ExtChunkResult), ctypes.c_int32]
-            sc_gpu_lib.refine_candidates_y.restype = None
-        if hasattr(sc_gpu_lib, "get_progress"):
-            sc_gpu_lib.get_progress.argtypes = []
-            sc_gpu_lib.get_progress.restype = ctypes.c_int32
-        if hasattr(sc_gpu_lib, "get_processed_centers"):
-            sc_gpu_lib.get_processed_centers.argtypes = []
-            sc_gpu_lib.get_processed_centers.restype = ctypes.c_int64
-        if hasattr(sc_gpu_lib, "get_gpu_scan_work_ns"):
-            sc_gpu_lib.get_gpu_scan_work_ns.argtypes = []
-            sc_gpu_lib.get_gpu_scan_work_ns.restype = ctypes.c_int64
-        if hasattr(sc_gpu_lib, "get_cuda_device_count"):
-            sc_gpu_lib.get_cuda_device_count.argtypes = []
-            sc_gpu_lib.get_cuda_device_count.restype = ctypes.c_int32
-        if hasattr(sc_gpu_lib, "get_cuda_device_name"):
-            sc_gpu_lib.get_cuda_device_name.argtypes = [ctypes.POINTER(ctypes.c_char), ctypes.c_int32]
-            sc_gpu_lib.get_cuda_device_name.restype = ctypes.c_int32
-        if hasattr(sc_gpu_lib, "get_gpu_v34_shape"):
-            sc_gpu_lib.get_gpu_v34_shape.argtypes = []
-            sc_gpu_lib.get_gpu_v34_shape.restype = ctypes.c_int32
-        if hasattr(sc_gpu_lib, "get_gpu_v34_rng"):
-            sc_gpu_lib.get_gpu_v34_rng.argtypes = []
-            sc_gpu_lib.get_gpu_v34_rng.restype = ctypes.c_int32
+            getattr(sc_gpu_lib, func).argtypes = []
+            getattr(sc_gpu_lib, func).restype = None
+        sc_gpu_lib.set_y_scan_config.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
+        sc_gpu_lib.set_y_scan_config.restype = None
+        sc_gpu_lib.refine_candidates_y.argtypes = [ctypes.c_int64, ctypes.POINTER(ExtChunkResult), ctypes.c_int32]
+        sc_gpu_lib.refine_candidates_y.restype = None
+        sc_gpu_lib.get_progress.argtypes = []
+        sc_gpu_lib.get_progress.restype = ctypes.c_int32
+        sc_gpu_lib.get_processed_centers.argtypes = []
+        sc_gpu_lib.get_processed_centers.restype = ctypes.c_int64
+        sc_gpu_lib.get_gpu_scan_work_ns.argtypes = []
+        sc_gpu_lib.get_gpu_scan_work_ns.restype = ctypes.c_int64
+        sc_gpu_lib.get_cuda_device_count.argtypes = []
+        sc_gpu_lib.get_cuda_device_count.restype = ctypes.c_int32
+        sc_gpu_lib.get_cuda_device_name.argtypes = [ctypes.POINTER(ctypes.c_char), ctypes.c_int32]
+        sc_gpu_lib.get_cuda_device_name.restype = ctypes.c_int32
+        for name in ("get_gpu_v1_shape", "get_gpu_v34_shape", "get_gpu_v1_rng", "get_gpu_v34_rng"):
+            if hasattr(sc_gpu_lib, name):
+                fn = getattr(sc_gpu_lib, name)
+                fn.argtypes = []
+                fn.restype = ctypes.c_int32
     except Exception: sc_gpu_lib = None
 
-# Decide whether the GPU algorithm is actually usable for Auto mode.
 if sc_gpu_lib:
-    if hasattr(sc_gpu_lib, "get_cuda_device_count"):
-        try:
-            GPU_DEVICE_COUNT = int(sc_gpu_lib.get_cuda_device_count())
-            if GPU_DEVICE_COUNT > 0:
-                GPU_AVAILABLE = True
-                GPU_STATUS_MSG = f"检测到 CUDA 设备 {GPU_DEVICE_COUNT} 个，GPU 算法可用。"
-            else:
-                GPU_AVAILABLE = False
-                GPU_STATUS_MSG = "GPU DLL 已加载，但 CUDA 驱动/设备检查返回 0。"
-        except Exception as e:
-            GPU_AVAILABLE = False
-            GPU_STATUS_MSG = f"GPU DLL 已加载，但 CUDA 设备检查失败：{e}"
-    elif GPU_DRIVER_AVAILABLE:
-        GPU_AVAILABLE = True
-        GPU_STATUS_MSG = GPU_DRIVER_MSG + " GPU DLL 未提供设备计数接口，按驱动存在处理。"
-    else:
+    try:
+        GPU_DEVICE_COUNT = int(sc_gpu_lib.get_cuda_device_count())
+        GPU_AVAILABLE = GPU_DEVICE_COUNT > 0
+        GPU_STATUS_MSG = (
+            f"检测到 CUDA 设备 {GPU_DEVICE_COUNT} 个，GPU 算法可用。"
+            if GPU_AVAILABLE else "GPU DLL 已加载，但未检测到 CUDA 设备。")
+    except Exception as e:
         GPU_AVAILABLE = False
-        GPU_STATUS_MSG = GPU_DRIVER_MSG
+        GPU_STATUS_MSG = f"CUDA 设备检查失败：{e}"
 else:
-    GPU_AVAILABLE = False
     GPU_STATUS_MSG = "未加载 slimecore_gpu.dll。"
 
-if sc_gpu_lib and GPU_AVAILABLE and hasattr(sc_gpu_lib, "get_cuda_device_name"):
+if GPU_AVAILABLE:
     try:
         _gpu_name_buf = ctypes.create_string_buffer(256)
         if int(sc_gpu_lib.get_cuda_device_name(_gpu_name_buf, len(_gpu_name_buf))) > 0:
@@ -828,59 +646,90 @@ if sc_gpu_lib and GPU_AVAILABLE and hasattr(sc_gpu_lib, "get_cuda_device_name"):
     except Exception:
         pass
 
-# If CPU is absent and GPU is not usable, do not let Python fallback silently use
-# a host helper from the unavailable GPU DLL as its slime-check algorithm.
+# ===== 搜索核心 =====
 if not sc_cpu_lib and not GPU_AVAILABLE:
     is_slime_chunk_fast = None
 
 def cleanup_native_resources():
     for lib in (sc_cpu_lib, sc_gpu_lib):
-        if lib and hasattr(lib, "request_cancel"):
+        if lib:
             try: lib.request_cancel()
             except Exception: pass
-    if sc_gpu_lib and hasattr(sc_gpu_lib, "cleanup_gpu_resources"):
+    if sc_gpu_lib:
         try: sc_gpu_lib.cleanup_gpu_resources()
         except Exception: pass
 
-import atexit
 atexit.register(cleanup_native_resources)
 thread_local = threading.local()
+_active_mc_version = DEFAULT_MC_VERSION
+
+JAVA_LONG_MIN = -(1 << 63)
+JAVA_LONG_MAX = (1 << 63) - 1
+
+def is_minecraft_text_seed(seed):
+    if not isinstance(seed, str):
+        return False
+    text = seed
+    if not re.fullmatch(r"[+-]?[0-9]+", text):
+        return True
+    try:
+        value = int(text, 10)
+    except ValueError:
+        return True
+    return value < JAVA_LONG_MIN or value > JAVA_LONG_MAX
+
+def java_string_hash_seed(text):
+    data = str(text).encode("utf-16-be", errors="surrogatepass")
+    value = 0
+    for i in range(0, len(data), 2):
+        code_unit = (data[i] << 8) | data[i + 1]
+        value = (value * 31 + code_unit) & 0xFFFFFFFF
+    return ctypes.c_int32(value).value
 
 def normalize_java_seed(seed):
-    """Normalize numeric Minecraft seeds to signed Java long range."""
+    if isinstance(seed, str):
+        if is_minecraft_text_seed(seed):
+            return java_string_hash_seed(seed)
+        return int(seed, 10)
     return ctypes.c_int64(int(seed)).value
+
+def cubiomes_version_code(version=None):
+    version = "1.21.4" if str(version or _active_mc_version) == "1.21 WD" else str(version or _active_mc_version)
+    if cb and hasattr(cb, "str2mc"):
+        code = int(cb.str2mc(version.encode("ascii")))
+        if code > 0:
+            return code
+    fallback = {
+        "1.19": 24, "1.20": 25, "1.21.1": 26, "1.21.3": 27,
+        "1.21.4": 28, "1.21.5": 29, "1.21.6": 30, "1.21.9": 31,
+        "1.21.11": 32, "26.1": 33, "26.2": 34,
+    }
+    return fallback.get(version, fallback[DEFAULT_MC_VERSION])
+
+def set_cubiomes_mc_version(version):
+    global _active_mc_version
+    version = "1.21.4" if str(version) == "1.21 WD" else str(version)
+    if version not in SUPPORTED_MC_VERSIONS:
+        version = DEFAULT_MC_VERSION
+    _active_mc_version = version
+    return _active_mc_version
 
 def get_local_generator(seed):
     if not cb: return None
-    if not hasattr(thread_local, "buf"):
+    version_code = cubiomes_version_code()
+    if not hasattr(thread_local, "buf") or getattr(thread_local, "generator_version", None) != version_code:
         try:
-            buf = ctypes.create_string_buffer(65536)
-            cb.setupGenerator(buf, 24, 0)
+            buf = ctypes.create_string_buffer(CUBIOMES_GENERATOR_BUFFER_SIZE)
+            cb.setupGenerator(buf, version_code, 0)
             thread_local.buf = buf
+            thread_local.generator_version = version_code
+            thread_local.generator_seed = None
         except Exception: return None
-    cb.applySeed(thread_local.buf, 0, ctypes.c_uint64(normalize_java_seed(seed) & 0xFFFFFFFFFFFFFFFF))
-    return thread_local.buf
-
-_spawn_position_cache = {}
-def get_world_spawn(seed):
     seed_i64 = normalize_java_seed(seed)
-    cached = _spawn_position_cache.get(seed_i64)
-    if cached is not None:
-        return cached
-    result = (0, 0)
-    try:
-        if cb and hasattr(cb, "getSpawn"):
-            gen = get_local_generator(seed_i64)
-            if gen is not None:
-                pos = cb.getSpawn(gen)
-                result = (int(pos.x), int(pos.z))
-    except Exception:
-        result = (0, 0)
-    _spawn_position_cache[seed_i64] = result
-    if len(_spawn_position_cache) > 4096:
-        _spawn_position_cache.clear()
-        _spawn_position_cache[seed_i64] = result
-    return result
+    if getattr(thread_local, "generator_seed", None) != seed_i64:
+        cb.applySeed(thread_local.buf, 0, ctypes.c_uint64(seed_i64 & 0xFFFFFFFFFFFFFFFF))
+        thread_local.generator_seed = seed_i64
+    return thread_local.buf
 
 def is_slime_chunk(seed, chunk_x, chunk_z):
     if is_slime_chunk_fast: return is_slime_chunk_fast(normalize_java_seed(seed), chunk_x, chunk_z)
@@ -947,8 +796,11 @@ def refine_y_candidates(seed, candidates, engine_choice, threads):
     if not candidates: return candidates
     buffer = (ExtChunkResult * len(candidates))()
     for i, item in enumerate(candidates):
-        buffer[i].size, buffer[i].center_x, buffer[i].center_z = int(item[0]), int(item[1]), int(item[2])
-        buffer[i].obs_count, buffer[i].afk_x, buffer[i].afk_z = 0, int(item[1]), int(item[2])
+        # 从原始候选中心细化，避免重复细化漂移。
+        center_x = int(item[3]) * 16 + 8
+        center_z = int(item[4]) * 16 + 8
+        buffer[i].size, buffer[i].center_x, buffer[i].center_z = int(item[0]), center_x, center_z
+        buffer[i].obs_count, buffer[i].afk_x, buffer[i].afk_z = 0, center_x, center_z
     refined = False
     if is_gpu_engine(engine_choice) and gpu_algorithm_available() and hasattr(sc_gpu_lib, "refine_candidates_y"):
         sc_gpu_lib.refine_candidates_y(normalize_java_seed(seed), buffer, len(candidates))
@@ -959,18 +811,15 @@ def refine_y_candidates(seed, candidates, engine_choice, threads):
     if not refined: return candidates
     out = []
     for i, item in enumerate(candidates):
-        _obs_from_y_scan, afk_y = unpack_obs_y(buffer[i].obs_count, True)
-        # 扫描挂机Y必须是纯后处理：只补 Y，不改变 X/Z，也不改原本的 obs_count。
-        # 否则开启Y扫会把候选中心/排序分数一起换掉，导致“开Y和不开Y结果不同”。
-        old_obs = item[6] if len(item) > 6 else 0
+        obs_from_y_scan, afk_y = unpack_obs_y(buffer[i].obs_count, True)
         out.append((
             item[0],
-            item[1],
-            item[2],
+            int(buffer[i].afk_x),
+            int(buffer[i].afk_z),
             item[3],
             item[4],
             item[5],
-            old_obs,
+            int(obs_from_y_scan),
             afk_y
         ))
     return out
@@ -1014,13 +863,9 @@ def choose_native_precise_scorer(preferred_engine=None):
         return "gpu_refine", True
     return None, False
 
-def score_candidates_precise_native(seed, candidates, threads, progress_cb=None, preferred_engine=None, config=None):
-    """Fill obs_count and best AFK X/Z in native code.
-    This avoids Python-side per-candidate comparison. It can use:
-    - GPU refine_candidates_y() when the selected engine is GPU;
-    - CPU score_candidates_precise() when compiled into slimecore.dll;
-    - CPU refine_candidates_y() as a compatibility fallback.
-    """
+def score_candidates_precise_native(
+        seed, candidates, threads, progress_cb=None, preferred_engine=None,
+        config=None, scan_y=False):
     if not candidates:
         return None
     scorer_kind, unpack_packed_y = choose_native_precise_scorer(preferred_engine)
@@ -1034,10 +879,6 @@ def score_candidates_precise_native(seed, candidates, threads, progress_cb=None,
     threads = max(1, int(threads))
     done = 0
 
-    # For ranking we only want platform-Y scoring here. The separate "scan Y"
-    # step still runs later and is deliberately only allowed to fill Y.
-    configure_y_scan(False)
-
     while done < total:
         if progress_cb:
             try:
@@ -1048,36 +889,40 @@ def score_candidates_precise_native(seed, candidates, threads, progress_cb=None,
         buffer = (ExtChunkResult * len(chunk))()
         for i, item in enumerate(chunk):
             buffer[i].size = int(item[0])
-            # center_x/center_z are the candidate center; native scoring may put
-            # the best AFK X/Z into afk_x/afk_z, while center_x/Z stay available
-            # for farm-center chunk and biome checks.
-            buffer[i].center_x = int(item[1])
-            buffer[i].center_z = int(item[2])
+            # item[3:5] 是原始候选中心。
+            center_x = int(item[3]) * 16 + 8
+            center_z = int(item[4]) * 16 + 8
+            buffer[i].center_x = center_x
+            buffer[i].center_z = center_z
             buffer[i].obs_count = 0
-            buffer[i].afk_x = int(item[1])
-            buffer[i].afk_z = int(item[2])
+            buffer[i].afk_x = center_x
+            buffer[i].afk_z = center_z
 
-        if scorer_kind == "gpu_refine":
-            sc_gpu_lib.refine_candidates_y(seed_i64, buffer, len(chunk))
-        elif scorer_kind == "cpu_score":
-            sc_cpu_lib.score_candidates_precise(seed_i64, buffer, len(chunk), threads, 1)
-        elif scorer_kind == "cpu_refine":
-            sc_cpu_lib.refine_candidates_y(seed_i64, buffer, len(chunk), threads)
-        else:
-            return None
+        configure_y_scan(bool(scan_y))
+        try:
+            if scorer_kind == "gpu_refine":
+                sc_gpu_lib.refine_candidates_y(seed_i64, buffer, len(chunk))
+            elif scorer_kind == "cpu_score":
+                sc_cpu_lib.score_candidates_precise(seed_i64, buffer, len(chunk), threads, 1)
+            elif scorer_kind == "cpu_refine":
+                sc_cpu_lib.refine_candidates_y(seed_i64, buffer, len(chunk), threads)
+            else:
+                return None
+        finally:
+            if scan_y:
+                configure_y_scan(False)
 
         for i, item in enumerate(chunk):
-            obs, afk_y = unpack_obs_y(buffer[i].obs_count, unpack_packed_y)
-            center_x = int(buffer[i].center_x)
-            center_z = int(buffer[i].center_z)
+            obs, afk_y = unpack_obs_y(
+                buffer[i].obs_count, unpack_packed_y or bool(scan_y))
             afk_x = int(buffer[i].afk_x)
             afk_z = int(buffer[i].afk_z)
             out.append((
                 int(item[0]),
                 afk_x,
                 afk_z,
-                center_x // 16,
-                center_z // 16,
+                int(item[3]),
+                int(item[4]),
                 item[5],
                 int(obs),
                 afk_y
@@ -1096,25 +941,24 @@ def read_native_candidates(buffer, count, seed, scan_y=False):
 def run_gpu_scan(seed, rd_max, min_size, max_size, rd_min, buf_size, precise, center_cx=0, center_cz=0):
     buffer = (ExtChunkResult * buf_size)()
     seed_i64 = normalize_java_seed(seed)
-    if hasattr(sc_gpu_lib, "search_slime_clusters_gpu_v34_centered"):
-        found_count = sc_gpu_lib.search_slime_clusters_gpu_v34_centered(
-            seed_i64, rd_max, min_size, max_size, rd_min,
-            int(center_cx), int(center_cz), buffer, buf_size, precise)
-    elif int(center_cx) == 0 and int(center_cz) == 0:
-        found_count = sc_gpu_lib.search_slime_clusters_gpu_v34(
-            seed_i64, rd_max, min_size, max_size, rd_min, buffer, buf_size, precise)
-    else:
-        raise RuntimeError("当前 GPU DLL 版本不支持自定义搜索中心，请重新编译/更新 slimecore_gpu.dll。")
+    search_fn = getattr(sc_gpu_lib, "search_slime_clusters_gpu_v1_centered", None)
+    if search_fn is None:
+        search_fn = sc_gpu_lib.search_slime_clusters_gpu_v34_centered
+    found_count = search_fn(
+        seed_i64, rd_max, min_size, max_size, rd_min,
+        int(center_cx), int(center_cz), buffer, buf_size, precise)
     if found_count < 0:
         raise RuntimeError("当前 GPU 精确算法执行失败；正式版不包含旧算法回退。")
-    algorithm = GPU_V34_ALGORITHM
-    if hasattr(sc_gpu_lib, "get_gpu_v34_shape"):
-        shape = int(sc_gpu_lib.get_gpu_v34_shape())
+    algorithm = GPU_V1_ALGORITHM
+    shape_fn = getattr(sc_gpu_lib, "get_gpu_v1_shape", getattr(sc_gpu_lib, "get_gpu_v34_shape", None))
+    if shape_fn:
+        shape = int(shape_fn())
         shape_names = {1: "128×8", 2: "256×4", 3: "256×8", 4: "512×4"}
         if shape in shape_names:
             algorithm += " · 自动选择 {}".format(shape_names[shape])
-    if hasattr(sc_gpu_lib, "get_gpu_v34_rng"):
-        rng = int(sc_gpu_lib.get_gpu_v34_rng())
+    rng_fn = getattr(sc_gpu_lib, "get_gpu_v1_rng", getattr(sc_gpu_lib, "get_gpu_v34_rng", None))
+    if rng_fn:
+        rng = int(rng_fn())
         rng_names = {0: "Native", 1: "Limb32", 2: "Truncated"}
         algorithm += " · RNG {}".format(rng_names.get(rng, "Native"))
     extract_count = max(0, min(int(found_count), buf_size))
@@ -1123,25 +967,20 @@ def run_gpu_scan(seed, rd_max, min_size, max_size, rd_min, buf_size, precise, ce
 def run_cpu_scan(seed, rd_max, min_size, max_size, rd_min, buf_size, threads, precise, center_cx=0, center_cz=0):
     buffer = (ExtChunkResult * buf_size)()
     seed_i64 = normalize_java_seed(seed)
-    if hasattr(sc_cpu_lib, "search_slime_clusters_centered"):
-        found_count = sc_cpu_lib.search_slime_clusters_centered(
-            seed_i64, rd_max, min_size, max_size, rd_min,
-            int(center_cx), int(center_cz), buffer, buf_size, threads, precise)
-    elif int(center_cx) == 0 and int(center_cz) == 0:
-        found_count = sc_cpu_lib.search_slime_clusters(
-            seed_i64, rd_max, min_size, max_size, rd_min, buffer, buf_size, threads, precise)
-    else:
-        raise RuntimeError("当前 CPU DLL 版本不支持自定义搜索中心，请重新编译/更新 slimecore.dll。")
+    found_count = sc_cpu_lib.search_slime_clusters_centered(
+        seed_i64, rd_max, min_size, max_size, rd_min,
+        int(center_cx), int(center_cz), buffer, buf_size, threads, precise)
+    if found_count < 0:
+        raise RuntimeError("当前 CPU 精确算法执行失败。")
     extract_count = max(0, min(int(found_count), buf_size))
     return read_native_candidates(buffer, extract_count, seed_i64, False), found_count
 
 def search_slime_clusters_py(seed, rd_max, min_size, max_size, rd_min, buf_size, c_obj=None, is_precise=True, center_cx=0, center_cz=0):
     import heapq
     rd_min_sq = float(rd_min * rd_min)
-    spawn_x, spawn_z = get_world_spawn(seed)
     total_rows = 2 * rd_max + 1
     leaderboard = []
-    max_keep = min(buf_size, 1000000 if is_precise else 500000)
+    max_keep = min(buf_size, MAX_CANDIDATE_BUFFER if is_precise else 500000)
     absolute_total = 0
 
     def push_candidate(key, item):
@@ -1168,49 +1007,45 @@ def search_slime_clusters_py(seed, rd_max, min_size, max_size, rd_min, buf_size,
                     # 直接计算刷怪格数，再只保留当前最优池。否则会先按规模截断，漏掉低规模但高刷怪格数的候选。
                     obs = calc_spawnable_spaces(seed, bx, bz)
                     item = (count, bx, bz, bx // 16, bz // 16, seed, obs, None)
-                    dx_spawn, dz_spawn = bx - spawn_x, bz - spawn_z
-                    dist_sq = dx_spawn * dx_spawn + dz_spawn * dz_spawn
-                    key = (obs, count, -dist_sq, -bx, -bz, seed)
+                    key = (obs, count, -bx, -bz, seed)
                 else:
                     item = (count, bx, bz, bx // 16, bz // 16, seed, 0, None)
-                    dx_spawn, dz_spawn = bx - spawn_x, bz - spawn_z
-                    dist_sq = dx_spawn * dx_spawn + dz_spawn * dz_spawn
-                    key = (count, -dist_sq, -bx, -bz, seed)
+                    key = (count, -bx, -bz, seed)
                 push_candidate(key, item)
 
     final_res = [item for _key, item in leaderboard]
     if is_precise:
-        final_res.sort(key=lambda x: (x[6], x[0], -((x[1] - spawn_x) ** 2 + (x[2] - spawn_z) ** 2), -x[1], -x[2], x[5]), reverse=True)
+        final_res.sort(key=lambda x: (x[6], x[0], -x[1], -x[2], x[5]), reverse=True)
     else:
-        final_res.sort(key=lambda x: (x[0], -((x[1] - spawn_x) ** 2 + (x[2] - spawn_z) ** 2), -x[1], -x[2], x[5]), reverse=True)
+        final_res.sort(key=lambda x: (x[0], -x[1], -x[2], x[5]), reverse=True)
     return final_res, absolute_total
 
 def check_deep_dark_fast(buf, center_chunk_x, center_chunk_z, seed):
-    if not buf or not cb: return False
-    try:
-        for dx in range(-8, 9):
-            for dz in range(-8, 9):
-                if dx * dx + dz * dz <= 68 and is_slime_chunk(seed, center_chunk_x + dx, center_chunk_z + dz):
-                    node_cx, node_cz = (center_chunk_x + dx) * 4, (center_chunk_z + dz) * 4
-                    for y_node in range(-16, 1):
-                        for nx in range(0, 4, 2):
-                            for nz in range(0, 4, 2):
-                                if cb.getBiomeAt(buf, 4, node_cx + nx, y_node, node_cz + nz) in (52, 183, 192, 193): return True
+    if not buf or not cb:
         return False
-    except Exception: return False
+    for dx in range(-8, 9):
+        for dz in range(-8, 9):
+            if dx * dx + dz * dz <= 68 and is_slime_chunk(seed, center_chunk_x + dx, center_chunk_z + dz):
+                node_cx, node_cz = (center_chunk_x + dx) * 4, (center_chunk_z + dz) * 4
+                for y_node in range(-16, 1):
+                    for nx in range(4):
+                        for nz in range(4):
+                            if cb.getBiomeAt(buf, 4, node_cx + nx, y_node, node_cz + nz) == 183:
+                                return True
+    return False
 
 def check_mushroom_fast(buf, center_chunk_x, center_chunk_z, seed):
-    if not buf or not cb: return False
-    try:
-        for dx in range(-8, 9):
-            for dz in range(-8, 9):
-                if dx * dx + dz * dz <= 68 and is_slime_chunk(seed, center_chunk_x + dx, center_chunk_z + dz):
-                    node_cx, node_cz = (center_chunk_x + dx) * 4, (center_chunk_z + dz) * 4
-                    for nx in range(0, 4, 2):
-                        for nz in range(0, 4, 2):
-                            if cb.getBiomeAt(buf, 4, node_cx + nx, 16, node_cz + nz) == 14: return True
+    if not buf or not cb:
         return False
-    except Exception: return False
+    for dx in range(-8, 9):
+        for dz in range(-8, 9):
+            if dx * dx + dz * dz <= 68 and is_slime_chunk(seed, center_chunk_x + dx, center_chunk_z + dz):
+                node_cx, node_cz = (center_chunk_x + dx) * 4, (center_chunk_z + dz) * 4
+                for nx in range(4):
+                    for nz in range(4):
+                        if cb.getBiomeAt(buf, 4, node_cx + nx, 16, node_cz + nz) == 14:
+                            return True
+    return False
 
 def create_slime_map(seed, block_x, block_z, dest_path):
     img = QImage(512, 512, QImage.Format.Format_ARGB32)
@@ -1237,9 +1072,10 @@ def create_slime_map(seed, block_x, block_z, dest_path):
     painter.end()
     img.save(dest_path)
 
+# ===== 配置与任务 =====
 class Config:
     def __init__(self):
-        self.settings_file = "settings.json"
+        self.settings_file = os.path.join(APP_DIR, "settings.json")
         self.max_sys_threads = os.cpu_count() or 4
         self.load()
     def load(self):
@@ -1263,14 +1099,16 @@ class Config:
                     self.precise_afk = data.get('precise_afk', True)
                     self.scan_y = data.get('scan_y', False)
                     self.result_limit = clamp_int(data.get('result_limit', DEFAULT_RESULT_LIMIT), DEFAULT_RESULT_LIMIT, 1, MAX_RESULT_LIMIT)
-                    self.theme = str(data.get('theme', 'dark')).lower()
-                    if self.theme not in ('dark', 'light'):
-                        self.theme = 'dark'
-                    self.candidate_buffer = clamp_int(data.get('candidate_buffer', 1000000), 1000000, 1000, 3000000)
+                    self.candidate_buffer = clamp_int(data.get('candidate_buffer', 1000000), 1000000, 1000, MAX_CANDIDATE_BUFFER)
                     # 0 means auto: no-biome filter keeps Top 200, biome filter keeps Top 2000.
                     self.precise_target_pool = clamp_int(data.get('precise_target_pool', 0), 0, 0, 20000)
                     self.native_score_chunk = clamp_int(data.get('native_score_chunk', 8192), 8192, 128, 20000)
                     self.precise_exhaustive = bool(data.get('precise_exhaustive', False))
+                    self.minecraft_version = str(data.get('minecraft_version', DEFAULT_MC_VERSION))
+                    if self.minecraft_version == "1.21 WD":
+                        self.minecraft_version = "1.21.4"
+                    if self.minecraft_version not in SUPPORTED_MC_VERSIONS:
+                        self.minecraft_version = DEFAULT_MC_VERSION
             except Exception: self.set_defaults()
         else: self.set_defaults()
     def set_defaults(self):
@@ -1280,11 +1118,11 @@ class Config:
         self.threads = max(1, int(self.max_sys_threads * 0.8))
         self.selected_engine, self.precise_afk, self.scan_y = "Auto", True, False
         self.result_limit = DEFAULT_RESULT_LIMIT
-        self.theme = 'dark'
         self.candidate_buffer = 1000000
         self.precise_target_pool = 0
         self.native_score_chunk = 8192
         self.precise_exhaustive = False
+        self.minecraft_version = DEFAULT_MC_VERSION
     def save(self):
         try:
             with open(self.settings_file, 'w', encoding='utf-8') as f:
@@ -1292,20 +1130,21 @@ class Config:
                     'use_range': self.use_range, 'use_min_radius': self.use_min_radius,
                     'max': self.max_size, 'min': self.min_size,
                     'last_seed': self.last_seed, 'last_radius': self.last_radius,
-                    'search_center_x': getattr(self, 'search_center_x', 0),
-                    'search_center_z': getattr(self, 'search_center_z', 0),
+                    'search_center_x': self.search_center_x,
+                    'search_center_z': self.search_center_z,
                     'min_search_radius': self.min_search_radius, 'threads': self.threads,
-                    'selected_engine': getattr(self, 'selected_engine', "Auto"),
-                    'precise_afk': getattr(self, 'precise_afk', True),
-                    'scan_y': getattr(self, 'scan_y', False),
-                    'result_limit': clamp_int(getattr(self, 'result_limit', DEFAULT_RESULT_LIMIT), DEFAULT_RESULT_LIMIT, 1, MAX_RESULT_LIMIT),
-                    'theme': getattr(self, 'theme', 'dark'),
-                    'candidate_buffer': getattr(self, 'candidate_buffer', 1000000),
-                    'precise_target_pool': getattr(self, 'precise_target_pool', 0),
-                    'native_score_chunk': getattr(self, 'native_score_chunk', 8192),
-                    'precise_exhaustive': getattr(self, 'precise_exhaustive', False)
+                    'selected_engine': self.selected_engine,
+                    'precise_afk': self.precise_afk,
+                    'scan_y': self.scan_y,
+                    'result_limit': self.result_limit,
+                    'candidate_buffer': self.candidate_buffer,
+                    'precise_target_pool': self.precise_target_pool,
+                    'native_score_chunk': self.native_score_chunk,
+                    'precise_exhaustive': self.precise_exhaustive,
+                    'minecraft_version': self.minecraft_version
                 }, f, ensure_ascii=False, indent=2)
         except Exception: pass
+
 
 class C(QObject):
     l = pyqtSignal(str); i = pyqtSignal(str); p = pyqtSignal(int); t = pyqtSignal(str); info = pyqtSignal(str)
@@ -1320,65 +1159,30 @@ class C(QObject):
 def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choice, is_precise, scan_y, result_limit=DEFAULT_RESULT_LIMIT, is_dd_checked=None, center_cx=0, center_cz=0):
     result_limit = max(1, min(MAX_RESULT_LIMIT, int(result_limit or DEFAULT_RESULT_LIMIT)))
     def emit_progress(value):
-        try:
-            app.c.p.emit(max(0, min(100, int(value))))
-        except Exception:
-            pass
-
-    def _spawn_distance_sq(item):
-        x = int(item[1])
-        z = int(item[2])
-        sx, sz = get_world_spawn(item[5])
-        dx = x - sx
-        dz = z - sz
-        return dx * dx + dz * dz
-
-    def size_key(item):
-        # Equal slime size -> nearest to this seed's real world spawn first.
-        return (item[0], -_spawn_distance_sq(item), -item[1], -item[2], item[5])
+        app.c.p.emit(max(0, min(100, int(value))))
 
     def candidate_obs_score(item):
-        try:
-            return int(item[6]) if len(item) > 6 and item[6] is not None else 0
-        except Exception:
-            return 0
+        return int(item[6]) if item[6] is not None else 0
 
     def ranking_key(item):
-        # 精准模式仍优先真实刷怪格数；相同分数和相同史莱姆规模时，
-        # 距离该种子真实世界出生点更近的候选优先。
         obs_score = candidate_obs_score(item)
         score = obs_score if is_precise and obs_score > 0 else item[0]
-        return (score, item[0], -_spawn_distance_sq(item), -item[1], -item[2], item[5])
+        return (score, item[0], -item[1], -item[2], item[5])
 
     def with_obs(item, obs_count):
-        afk_y = item[7] if len(item) > 7 else None
-        return (item[0], item[1], item[2], item[3], item[4], item[5], int(obs_count), afk_y)
+        return (item[0], item[1], item[2], item[3], item[4], item[5], int(obs_count), item[7])
 
     def needs_precise_score(item):
         return candidate_obs_score(item) <= 0
 
-    upper_bound_cache = {}
-
     def candidate_upper_key(item):
-        try:
-            base_lx = int(item[1]) & 15
-            base_lz = int(item[2]) & 15
-            slime_count = int(item[0])
-            cache_key = (base_lx, base_lz, slime_count)
-            ub = upper_bound_cache.get(cache_key)
-            if ub is None:
-                best = 0
-                for dx in range(-16, 17, 4):
-                    for dz in range(-16, 17, 4):
-                        candidate = spawnable_upper_bound(
-                            ((base_lx + dx) & 15, (base_lz + dz) & 15), slime_count)
-                        if candidate > best:
-                            best = candidate
-                ub = best
-                upper_bound_cache[cache_key] = ub
-        except Exception:
-            ub = 0
-        return (ub, item[0], -_spawn_distance_sq(item), -item[1], -item[2], item[5])
+        slime_count = max(0, min(221, int(item[0])))
+        bounds = PRECISE_Y_SPAWN_SAFE_BOUND if scan_y else PRECISE_SPAWN_SAFE_BOUND
+        ub = bounds[slime_count]
+        # The score bound is safe by construction. Infinite tie components are
+        # deliberate: if an exact score equals the bound, the whole tuple must
+        # still dominate every possible final ranking key.
+        return (ub, item[0], float("inf"), float("inf"), float("inf"), float("inf"))
 
     def precise_native_batch_enabled():
         value = os.environ.get("SLIME_PRECISE_NATIVE_BATCH", "1").strip().lower()
@@ -1444,7 +1248,9 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
                 except Exception:
                     pass
 
-            scored_batch = score_candidates_precise_native(seed, batch, threads, on_native_progress, engine_choice, app.config)
+            scored_batch = score_candidates_precise_native(
+                seed, batch, threads, on_native_progress, engine_choice,
+                app.config, scan_y=scan_y)
             if scored_batch is None:
                 return None
 
@@ -1490,7 +1296,10 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
         missing_items = []
         ready_items = []
         for item in items:
-            if needs_precise_score(item):
+            # Platform-Y scores produced by the first native scan are not final
+            # when Y scanning is requested. Every candidate entering this stage
+            # must therefore be rescored against the real Y=-64..0 search.
+            if scan_y or needs_precise_score(item):
                 missing_items.append(item)
             else:
                 ready_items.append(item)
@@ -1588,12 +1397,11 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
         return out
 
     def apply_y_after_selection(seed, items, label="候选"):
-        """Y扫描只允许在候选已经选定后执行，只更新挂机Y。
-        这样开/关Y不会改变候选集合、X/Z、排序依据或刷怪格数。
-        """
         if not scan_y or not items:
             return items
-        app.c.l.emit("正在为 {} 个{}补扫挂机Y (-64..0, step=1)，只更新Y，不改变X/Z...".format(len(items), label))
+        if is_precise and all(len(item) > 7 and item[7] is not None for item in items):
+            return items
+        app.c.l.emit("正在为 {} 个{}补扫最佳挂机 XYZ（Y=-64..0, step=1）...".format(len(items), label))
         app.c.t.emit("正在扫描挂机 Y...")
         configure_y_scan(True)
         try:
@@ -1605,7 +1413,7 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
         """把候选整理到真正用于排序的状态。
         - 快速模式：按规模排序。
         - 精准模式：必须有 obs_count 才按刷怪格数排序。
-        - Y扫描不在这里执行；它只在最终候选确定后补Y，不能改变排序/筛选结果。
+        - 精准+Y模式：直接按最终最佳 XYZ/Y 分数做安全上界剪枝和排序。
         """
         if not candidates:
             return candidates
@@ -1632,7 +1440,7 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
         def scan_worker():
             try:
                 result_box["result"] = scan_callable()
-            except BaseException as exc:
+            except Exception as exc:
                 result_box["error"] = exc
             finally:
                 done_event.set()
@@ -1731,7 +1539,7 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
             buf_size = int(env_buffer) if env_buffer else int(configured_buffer)
         except Exception:
             buf_size = int(configured_buffer)
-        buf_size = max(1000, min(buf_size, 3000000))
+        buf_size = max(1000, min(buf_size, MAX_CANDIDATE_BUFFER))
         app.c.cancel = False
         emit_progress(1)
         app.c.t.emit("准备扫描...")
@@ -1744,7 +1552,7 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
             pool_text = "自动" if getattr(app.config, "precise_target_pool", 0) == 0 else "{:,}".format(getattr(app.config, "precise_target_pool", 0))
             app.c.l.emit("精准处理：{}；结果池：{}。".format(mode_text, pool_text))
         if scan_y:
-            app.c.l.emit("已启用挂机 Y 扫描；它只补挂机高度，不会自动开启精准排序。")
+            app.c.l.emit("已启用挂机 Y 扫描；精准模式会按最终最佳 XYZ/Y 直接排名。")
         if not is_precise:
             app.c.l.emit("当前为快速模式：不会按刷怪格数排序。")
 
@@ -1752,7 +1560,7 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
         all_results = []
         algorithms_used = set()
 
-        for d in ["data", "images", "history"]:
+        for d in ["data", "images"]:
             os.makedirs(os.path.join(APP_DIR, d), exist_ok=True)
 
         if is_dd_checked is None:
@@ -1794,7 +1602,7 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
                 app.c.l.emit("GPU 精确算法：{}。".format(gpu_algorithm))
                 app.c.l.emit("GPU 扫图完成：发现 {:,} 处候选，用时 {}。".format(found_count, format_elapsed(time.time() - start_time)))
             elif engine_choice == "CPU (AVX2/OpenMP)" and sc_cpu_lib:
-                algorithms_used.add("CPU 行前缀/SAT 精确模式")
+                algorithms_used.add("V1 CPU 行前缀/SAT 精确模式")
                 app.c.l.emit("CPU 模式扫描中...")
                 candidates, found_count = run_native_scan_with_heartbeat(
                     "CPU",
@@ -1809,7 +1617,7 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
                 )
                 app.c.l.emit("CPU 扫图完成：发现 {:,} 处候选，用时 {}。".format(found_count, format_elapsed(time.time() - start_time)))
             else:
-                algorithms_used.add("Python 精确后备模式")
+                algorithms_used.add("V1 Python 精确后备模式")
                 app.c.l.emit("启动 Python 后备模式（较慢）...")
                 candidates, found_count = search_slime_clusters_py(
                     sd, rd_max, ms, size_limit, rd_min, buf_size, app.c, is_precise,
@@ -1817,11 +1625,53 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
                 app.c.l.emit("Python 扫图完成：发现 {:,} 处候选，用时 {}。".format(found_count, format_elapsed(time.time() - start_time)))
 
             if is_precise:
-                try:
+                total_found = int(found_count)
+                if total_found > len(candidates):
+                    if total_found > MAX_CANDIDATE_BUFFER:
+                        raise RuntimeError(
+                            "精准结果已停止：共有 {:,} 个候选，但当前完整精准模式最多可回传 {:,} 个。"
+                            "继续排名会存在漏掉真实最佳点的风险；请提高最小规模或缩小搜索范围。".format(
+                                total_found, MAX_CANDIDATE_BUFFER))
+
+                    retry_buf = max(1000, total_found)
+                    app.c.l.emit(
+                        "精准完整性保护：首次缓冲只取回 {:,}/{:,} 个候选，自动扩大到 {:,} 并重新扫描。".format(
+                            len(candidates), total_found, retry_buf))
+
+                    retry_start = time.time()
+                    if engine_choice == "GPU (CUDA)" and gpu_algorithm_available():
+                        candidates, found_count, gpu_algorithm = run_native_scan_with_heartbeat(
+                            "GPU 完整候选重扫",
+                            sd,
+                            lambda sd=sd, retry_buf=retry_buf: run_gpu_scan(
+                                sd, rd_max, ms, size_limit, rd_min, retry_buf, native_precise,
+                                center_cx, center_cz),
+                            sc_gpu_lib,
+                            seed_base_pct,
+                            total_seeds,
+                            retry_start)
+                        algorithms_used.add(gpu_algorithm)
+                    elif engine_choice == "CPU (AVX2/OpenMP)" and sc_cpu_lib:
+                        candidates, found_count = run_native_scan_with_heartbeat(
+                            "CPU 完整候选重扫",
+                            sd,
+                            lambda sd=sd, retry_buf=retry_buf: run_cpu_scan(
+                                sd, rd_max, ms, size_limit, rd_min, retry_buf, threads, native_precise,
+                                center_cx, center_cz),
+                            sc_cpu_lib,
+                            seed_base_pct,
+                            total_seeds,
+                            retry_start)
+                    else:
+                        candidates, found_count = search_slime_clusters_py(
+                            sd, rd_max, ms, size_limit, rd_min, retry_buf, app.c, is_precise,
+                            center_cx, center_cz)
+
                     if int(found_count) > len(candidates):
-                        app.c.l.emit("提示：本次共有 {:,} 个候选满足用户规模条件，当前内存缓冲只取回 {:,} 个；如需更完整的精准比对，可增大环境变量 SLIME_CANDIDATE_BUFFER 或让 DLL 支持分页输出。".format(int(found_count), len(candidates)))
-                except Exception:
-                    pass
+                        raise RuntimeError(
+                            "精准结果已停止：自动重扫后仍只取回 {:,}/{:,} 个候选，无法证明排名完整。".format(
+                                len(candidates), int(found_count)))
+                    app.c.l.emit("精准完整性保护通过：{:,} 个候选已全部取回。".format(len(candidates)))
 
             emit_progress(seed_base_pct + 35 / total_seeds)
 
@@ -1852,13 +1702,18 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
                 elif FILTER_MUSHROOM_ISLAND:
                     check_msg = "排查蘑菇岛"
 
+                # 精准+Y在进入群系过滤前已按最终最佳XYZ/Y完成评分和排序；
+                # 因此只需从榜首向下检查，凑够最终Top-N即可停止。
                 target_valid = result_limit
                 accepted_this_seed = 0
                 accepted_candidates = []
                 processed = 0
                 filtered_this_seed = 0
                 dd_start_time = time.time()
-                app.c.l.emit("正在{}，目标保留前 {} 个有效结果...".format(check_msg, target_valid))
+                if scan_y:
+                    app.c.l.emit("正在{}，先检查全部 {} 个精准候选，再按最佳Y重新排名...".format(check_msg, target_valid))
+                else:
+                    app.c.l.emit("正在{}，目标保留前 {} 个有效结果...".format(check_msg, target_valid))
 
                 def validate_task(item):
                     generator = get_local_generator(item[5])
@@ -1927,18 +1782,20 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
                 accepted_candidates.sort(key=ranking_key, reverse=True)
                 accepted_candidates = apply_y_after_selection(sd, accepted_candidates, "有效候选")
                 accepted_candidates.sort(key=ranking_key, reverse=True)
-                all_results.extend(accepted_candidates)
+                all_results.extend(accepted_candidates[:result_limit])
                 app.c.l.emit("群系排查完成：检查 {} 个，保留 {} 个，过滤 {} 个，用时 {}。".format(
                     processed, accepted_this_seed, filtered_this_seed, format_elapsed(time.time() - dd_start_time)))
             else:
                 candidates.sort(key=ranking_key, reverse=True)
-                # Keep only the requested Top-N from each seed. A result below
-                # this rank in its own seed cannot enter the global Top-N because
-                # that seed already has N better-or-equal candidates ahead of it.
-                candidates = candidates[:result_limit]
                 if scan_y:
-                    candidates = apply_y_after_selection(sd, candidates, "最终候选")
+                    # Y changes the actual score, so it must run before the
+                    # per-seed Top-N cut. Cutting first can discard a candidate
+                    # that should move into the final ranking after Y refinement.
+                    candidates = apply_y_after_selection(sd, candidates, "精准候选")
                     candidates.sort(key=ranking_key, reverse=True)
+                # Keep only the requested Top-N from each seed after every score
+                # component that can affect ranking has been finalized.
+                candidates = candidates[:result_limit]
                 all_results.extend(candidates)
 
             emit_progress(((idx + 1) / total_seeds) * 95)
@@ -1982,13 +1839,14 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
         search_params = {
             "seeds": [int(v) for v in seeds],
             "radius": int(rd_max),
-            "center_x": int(getattr(app.config, "search_center_x", int(center_cx) * 16)),
-            "center_z": int(getattr(app.config, "search_center_z", int(center_cz) * 16)),
+            "center_x": int(app.config.search_center_x),
+            "center_z": int(app.config.search_center_z),
             "min_radius": int(rd_min),
             "min_size": int(ms),
             "max_size": int(max_s) if use_range else None,
             "use_range": bool(use_range),
             "engine": str(engine_choice),
+            "minecraft_version": str(app.config.minecraft_version),
             "precise_afk": bool(is_precise),
             "scan_y": bool(scan_y),
             "result_limit": int(result_limit),
@@ -2005,7 +1863,6 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
             "history_timestamp": timestamp,
             "history_image": dest,
             "ranked_results": top_50_results,
-            "top_50_results": top_50_results,  # compatibility with older UI code
             "result_limit": int(result_limit)
         })
         app.c.i.emit(dest)
@@ -2043,6 +1900,7 @@ def generate_manual_image(app, seed, block_x, block_z):
 
 _ICON_CACHE = {}
 
+# ===== UI =====
 def _qcolor_key(color):
     c = QColor(color)
     return (c.red(), c.green(), c.blue(), c.alpha())
@@ -2127,6 +1985,20 @@ def create_fluent_icon(icon_color=None):
         return icon
     return _cached_icon(key, make)
 
+def create_history_icon(color=None):
+    color = QColor(200, 200, 200) if color is None else QColor(color)
+    key = ('history', _qcolor_key(color))
+    def make():
+        def draw(p, c):
+            p.setPen(QPen(c, 1.8))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(3, 3, 18, 18)
+            p.drawLine(12, 12, 12, 7)
+            p.drawLine(12, 12, 16, 14)
+        return QIcon(_draw_icon_pixmap(draw, color))
+    return _cached_icon(key, make)
+
+
 def create_burger_icon(color=None):
     color = QColor(200, 200, 200) if color is None else QColor(color)
     key = ('burger', _qcolor_key(color))
@@ -2144,10 +2016,33 @@ class SlimeApp(QWidget):
         super().__init__()
         self.c = C()
         self.config = Config()
+        set_cubiomes_mc_version(self.config.minecraft_version)
         self.main_pos = self.nether_pos = self.current_seed = self.current_size = self.current_image = self.current_obs_count = self.current_afk_y = None
         self.current_algorithm = None
         self.is_sidebar_expanded = True
         self._log_lines = []
+        self.top_50_results = []
+        self._rank_render_token = 0
+        self._progress_busy = False
+        self._search_cancelled = False
+        self.active_engine = ""
+
+        # ===== 彩蛋状态 =====
+        self._gpu_perf_click_times = []
+        self._gpu_perf_easter_until = 0.0
+        self._gpu_perf_restore_text = ""
+        self._pause_click_times = []
+        self._copy_easter_count = 0
+        self._empty_history_open_count = 0
+        self._hamburger_click_times = []
+        self._settings_cancel_count = 0
+        self._ranking_double_click_counts = {}
+        self._projection_save_cancel_count = 0
+        self._rank_one_apply_count = 0
+        self._resize_last_width = None
+        self._resize_last_dir = 0
+        self._resize_reversal_times = []
+        self._resize_easter_cooldown_until = 0.0
 
         # External palette overrides the built-in floor preview colors when available.
         self.color_card = {}
@@ -2199,123 +2094,6 @@ class SlimeApp(QWidget):
         if self.color_card_warning:
             QTimer.singleShot(0, self._report_color_card_warning)
 
-    def _theme_stylesheet(self, theme=None):
-        theme = (theme or getattr(self.config, "theme", "dark")).lower()
-        if theme == "light":
-            bg, panel, field, border = "#f5f5f5", "#ffffff", "#ffffff", "#d9d9d9"
-            text, muted, hover = "#151515", "#6c6c6c", "#eeeeee"
-            sidebar, selected = "#ffffff", "#f0f0f0"
-            accent, accent_hover = "#18864b", "#14723f"
-            log_bg = "#fafafa"
-        else:
-            bg, panel, field, border = "#111111", "#171717", "#202020", "#303030"
-            text, muted, hover = "#f1f1f1", "#9a9a9a", "#292929"
-            sidebar, selected = "#151515", "#242424"
-            accent, accent_hover = "#23965b", "#2aaa68"
-            log_bg = "#121212"
-        return f"""
-            QWidget {{ background: {bg}; color: {text}; font-family: 'Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI'; font-size: 12px; }}
-            QFrame#Sidebar {{ background: {sidebar}; border-right: 1px solid {border}; }}
-            QFrame#SearchPanel, QFrame#ResultPanel {{ background: {panel}; border: 1px solid {border}; border-radius: 8px; }}
-            QLabel#Muted {{ color: {muted}; }}
-            QLabel#Status {{ color: {muted}; padding: 2px 0; }}
-            QLineEdit, QTextEdit, QSpinBox, QComboBox {{ background: {field}; border: 1px solid {border}; border-radius: 5px; padding: 6px 8px; color: {text}; }}
-            QLineEdit:focus, QTextEdit:focus, QSpinBox:focus, QComboBox:focus {{ border-color: {accent}; }}
-            QSpinBox::up-button, QSpinBox::down-button {{ width: 0px; height: 0px; border: none; }}
-            QPushButton {{ background: {field}; border: 1px solid {border}; border-radius: 5px; padding: 7px 10px; color: {text}; }}
-            QPushButton:hover {{ background: {hover}; }}
-            QPushButton:pressed {{ background: {selected}; }}
-            QPushButton:disabled {{ color: {muted}; }}
-            QPushButton#Primary {{ background: {accent}; border-color: {accent}; color: white; font-weight: 600; }}
-            QPushButton#Primary:hover {{ background: {accent_hover}; }}
-            QFrame#Sidebar QPushButton {{ background: transparent; border: none; border-radius: 0; padding: 11px 12px 11px 17px; text-align: left; color: {muted}; }}
-            QFrame#Sidebar QPushButton:hover {{ background: {hover}; color: {text}; }}
-            QFrame#Sidebar QPushButton:checked {{ background: {selected}; color: {text}; font-weight: 600; border-left: 3px solid {accent}; }}
-            QGroupBox {{ border: 1px solid {border}; border-radius: 6px; margin-top: 10px; padding-top: 10px; font-weight: 600; }}
-            QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; }}
-            QProgressBar {{ background: {field}; border: 1px solid {border}; border-radius: 4px; text-align: center; color: {muted}; }}
-            QProgressBar::chunk {{ background: {accent}; border-radius: 3px; }}
-            QScrollArea, QListWidget, QTableWidget {{ background: {panel}; border: 1px solid {border}; border-radius: 6px; }}
-            QHeaderView::section {{ background: {field}; color: {muted}; border: none; border-bottom: 1px solid {border}; padding: 7px; }}
-            QTableWidget {{ gridline-color: {border}; selection-background-color: {selected}; selection-color: {text}; }}
-            QMenu {{ background: {panel}; color: {text}; border: 1px solid {border}; }}
-            QMenu::item {{ padding: 7px 18px; }}
-            QMenu::item:selected {{ background: {hover}; }}
-            QScrollBar:vertical {{ background: transparent; width: 10px; }}
-            QScrollBar::handle:vertical {{ background: {border}; min-height: 24px; border-radius: 5px; }}
-            QDialog QTextEdit#LogView {{ background: {log_bg}; }}
-        """
-
-    def _apply_theme(self):
-        self.setStyleSheet(self._theme_stylesheet())
-
-    def show_log_dialog(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("运行日志")
-        dlg.resize(760, 500)
-        dlg.setStyleSheet(self.styleSheet())
-        v = QVBoxLayout(dlg)
-        top = QHBoxLayout()
-        hint = QLabel("详细日志仅用于排查；主界面只显示当前状态。")
-        hint.setObjectName("Muted")
-        clear_btn = QPushButton("清空")
-        top.addWidget(hint)
-        top.addStretch()
-        top.addWidget(clear_btn)
-        v.addLayout(top)
-        view = QTextEdit()
-        view.setObjectName("LogView")
-        view.setReadOnly(True)
-        lines = getattr(self, "_log_lines", [])
-        view.setPlainText("\n".join(lines))
-        view.moveCursor(view.textCursor().MoveOperation.End)
-        v.addWidget(view, 1)
-        close_btn = QPushButton("关闭")
-        close_btn.clicked.connect(dlg.accept)
-        v.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignRight)
-
-        def clear_logs():
-            self._log_lines = []
-            view.clear()
-            if hasattr(self, "status_message_label"):
-                self.status_message_label.setText("准备就绪")
-        clear_btn.clicked.connect(clear_logs)
-        dlg.exec()
-
-    def open_manual_verify_dialog(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("手动验证坐标")
-        dlg.setFixedSize(400, 250)
-        dlg.setStyleSheet(self.styleSheet())
-        form = QFormLayout(dlg)
-        seed_edit = QLineEdit()
-        x_edit = QLineEdit()
-        z_edit = QLineEdit()
-        seed_edit.setPlaceholderText("世界种子")
-        x_edit.setPlaceholderText("方块 X")
-        z_edit.setPlaceholderText("方块 Z")
-        if self.current_seed is not None:
-            seed_edit.setText(str(self.current_seed))
-        if self.main_pos is not None:
-            x_edit.setText(str(self.main_pos[0]))
-            z_edit.setText(str(self.main_pos[1]))
-        form.addRow("种子", seed_edit)
-        form.addRow("X", x_edit)
-        form.addRow("Z", z_edit)
-        actions = QHBoxLayout()
-        image_btn = QPushButton("生成地图")
-        biome_btn = QPushButton("验证群系")
-        actions.addWidget(image_btn)
-        actions.addWidget(biome_btn)
-        form.addRow("", actions)
-
-        def sync_hidden():
-            self.manual_seed.setText(seed_edit.text())
-            self.manual_x.setText(x_edit.text())
-            self.manual_z.setText(z_edit.text())
-        image_btn.clicked.connect(lambda: (sync_hidden(), self.manual_generate()))
-        biome_btn.clicked.connect(lambda: (sync_hidden(), self.test_dd_manual()))
-        dlg.exec()
 
     def open_settings(self):
         dlg = QDialog(self)
@@ -2331,6 +2109,29 @@ class SlimeApp(QWidget):
 
         g1 = QGroupBox("高级搜索限制")
         l1 = QVBoxLayout(g1)
+        mc_row = QHBoxLayout()
+        mc_row.addWidget(QLabel("Minecraft 版本:"))
+        mc_version_combo = QComboBox()
+        for label, value in (
+            ("1.19", "1.19"),
+            ("1.20.x", "1.20"),
+            ("1.21.0-1.21.1", "1.21.1"),
+            ("1.21.2-1.21.3", "1.21.3"),
+            ("1.21.4", "1.21.4"),
+            ("1.21.5", "1.21.5"),
+            ("1.21.6-1.21.8", "1.21.6"),
+            ("1.21.9-1.21.10", "1.21.9"),
+            ("1.21.11", "1.21.11"),
+            ("26.1", "26.1"),
+            ("26.2", "26.2"),
+        ):
+            mc_version_combo.addItem(label, value)
+        current_index = mc_version_combo.findData(self.config.minecraft_version)
+        mc_version_combo.setCurrentIndex(max(0, current_index))
+        mc_version_combo.setToolTip("只影响 cubiomes 的出生点、深暗与蘑菇岛等世界生成辅助判断；史莱姆区块本身与版本无关。")
+        mc_row.addWidget(mc_version_combo)
+        mc_row.addStretch()
+        l1.addLayout(mc_row)
         cb_range = QCheckBox("启用最大规模限制")
         cb_range.setChecked(self.config.use_range)
         l1.addWidget(cb_range)
@@ -2363,21 +2164,21 @@ class SlimeApp(QWidget):
 
         result_limit_spin = QSpinBox()
         result_limit_spin.setRange(1, MAX_RESULT_LIMIT)
-        result_limit_spin.setValue(getattr(self.config, "result_limit", DEFAULT_RESULT_LIMIT))
+        result_limit_spin.setValue(self.config.result_limit)
         result_limit_spin.setToolTip("最终前端保留并显示多少名结果。默认 50；只影响最终 Top-N 数量，不改变 GPU 扫图范围。")
         form.addRow("最终显示排名数量:", result_limit_spin)
 
         buffer_spin = QSpinBox()
-        buffer_spin.setRange(1000, 3000000)
+        buffer_spin.setRange(1000, MAX_CANDIDATE_BUFFER)
         buffer_spin.setSingleStep(50000)
-        buffer_spin.setValue(getattr(self.config, "candidate_buffer", 1000000))
+        buffer_spin.setValue(self.config.candidate_buffer)
         buffer_spin.setToolTip("GPU/CPU DLL 最多把多少个候选坐标交给 Python 做后处理。不是扫描上限；扫描仍会完整进行。")
         form.addRow("最多回传候选数量:", buffer_spin)
 
         pool_spin = QSpinBox()
         pool_spin.setRange(0, 20000)
         pool_spin.setSingleStep(50)
-        pool_spin.setValue(getattr(self.config, "precise_target_pool", 0))
+        pool_spin.setValue(self.config.precise_target_pool)
         pool_spin.setSpecialValueText("自动")
         pool_spin.setToolTip("精准模式不会把所有候选都算到底，而是先用上界筛选，保留这批最有希望的候选做完整刷怪格数计算。0=自动。")
         form.addRow("进入完整精准评分的候选数:", pool_spin)
@@ -2385,12 +2186,12 @@ class SlimeApp(QWidget):
         chunk_spin = QSpinBox()
         chunk_spin.setRange(128, 20000)
         chunk_spin.setSingleStep(128)
-        chunk_spin.setValue(getattr(self.config, "native_score_chunk", 8192))
+        chunk_spin.setValue(self.config.native_score_chunk)
         chunk_spin.setToolTip("一次交给原生 CPU/GPU 评分函数多少个候选。大一点通常吞吐更好，但单批耗时更长、取消响应稍慢。")
         form.addRow("每批精准评分数量:", chunk_spin)
 
         exhaustive_cb = QCheckBox("所有回传候选都做完整精准评分（非常慢）")
-        exhaustive_cb.setChecked(getattr(self.config, "precise_exhaustive", False))
+        exhaustive_cb.setChecked(self.config.precise_exhaustive)
         exhaustive_cb.setToolTip("关闭时使用智能上界剪枝；开启后跳过剪枝，对候选缓冲里的全部候选计算刷怪格数。大范围不推荐。")
         form.addRow("全量精准模式:", exhaustive_cb)
 
@@ -2415,9 +2216,12 @@ class SlimeApp(QWidget):
         btns.addWidget(cancel_btn)
         v.addLayout(btns)
 
-        if dlg.exec():
+        dialog_result = dlg.exec()
+        if dialog_result:
             self.config.use_range = cb_range.isChecked()
             self.config.use_min_radius = cb_min_rad.isChecked()
+            self.config.minecraft_version = str(mc_version_combo.currentData())
+            set_cubiomes_mc_version(self.config.minecraft_version)
             self.config.threads = thread_spin.value()
             self.config.result_limit = result_limit_spin.value()
             self.config.candidate_buffer = buffer_spin.value()
@@ -2429,20 +2233,72 @@ class SlimeApp(QWidget):
             self.m_max.setVisible(self.config.use_range)
             self.rad_min_label.setVisible(self.config.use_min_radius)
             self.r_inner.setVisible(self.config.use_min_radius)
-            self.upd_log("高级设置已保存：候选缓冲 {:,}，智能结果池 {}，原生批量 {:,}，{}。".format(
+            self.upd_log("高级设置已保存：Minecraft {}，候选缓冲 {:,}，智能结果池 {}，原生批量 {:,}，{}。".format(
+                mc_version_combo.currentText(),
                 self.config.candidate_buffer,
                 "自动" if self.config.precise_target_pool == 0 else f"{self.config.precise_target_pool:,}",
                 self.config.native_score_chunk,
                 "全量精准" if self.config.precise_exhaustive else "智能精准"
             ))
+        else:
+            self._settings_cancel_count += 1
+            if self._settings_cancel_count >= 20:
+                self._settings_cancel_count = 0
+                self.upd_log("那你打开它干什么")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        now = time.monotonic()
+        width = event.size().width()
+        if self._resize_last_width is not None:
+            delta = width - self._resize_last_width
+            direction = 1 if delta >= 3 else (-1 if delta <= -3 else 0)
+            if direction and self._resize_last_dir and direction != self._resize_last_dir:
+                self._resize_reversal_times = [
+                    t for t in self._resize_reversal_times if now - t <= 2.5]
+                self._resize_reversal_times.append(now)
+                if (len(self._resize_reversal_times) >= 6
+                        and now >= self._resize_easter_cooldown_until
+                        and hasattr(self, "time_label")
+                        and not getattr(self, "_search_in_progress", False)):
+                    self._resize_reversal_times.clear()
+                    self._resize_easter_cooldown_until = now + 10.0
+                    self.time_label.setText("别拽了")
+                    QTimer.singleShot(2000, self._restore_resize_easter_text)
+            if direction:
+                self._resize_last_dir = direction
+        self._resize_last_width = width
         if hasattr(self, 'floor_scroller') and self.stacked.currentIndex() == 1:
             self.trigger_floor_preview_update()
 
+    def _restore_resize_easter_text(self):
+        if hasattr(self, "time_label") and self.time_label.text() == "别拽了":
+            self.time_label.setText("准备就绪")
+
+    def _set_gpu_perf_text(self, text):
+        if time.monotonic() < self._gpu_perf_easter_until:
+            return
+        self.gpu_perf_label.setText(text)
+
+    def _on_gpu_perf_click(self):
+        now = time.monotonic()
+        self._gpu_perf_click_times = [t for t in self._gpu_perf_click_times if now - t <= 2.5]
+        self._gpu_perf_click_times.append(now)
+        if len(self._gpu_perf_click_times) < 7:
+            return
+        self._gpu_perf_click_times.clear()
+        self._gpu_perf_restore_text = self.gpu_perf_label.text()
+        self._gpu_perf_easter_until = now + 2.0
+        self.gpu_perf_label.setText("你到底在看什么")
+        QTimer.singleShot(2000, self._restore_gpu_perf_easter)
+
+    def _restore_gpu_perf_easter(self):
+        self._gpu_perf_easter_until = 0.0
+        if self.gpu_perf_label.text() == "你到底在看什么":
+            self.gpu_perf_label.setText(self._gpu_perf_restore_text or "-- B/s")
+
     def get_floor_material_id(self) -> str:
-        if getattr(self, "chk_custom_floor_material", None) and self.chk_custom_floor_material.isChecked():
+        if self.chk_custom_floor_material.isChecked():
             return self._normalize_minecraft_block_id(self.proj_custom_block.text())
         return "minecraft:" + self.glass_options[self.proj_glass.currentText()]
 
@@ -2471,7 +2327,7 @@ class SlimeApp(QWidget):
     def _report_native_status(self):
         try:
             self.upd_log("cubiomes.dll：已加载" if cb else "cubiomes.dll：未加载")
-            self.upd_log("GPU驱动：已加载" if GPU_DRIVER_AVAILABLE else "GPU驱动：未检测到")
+            self.upd_log(f"GPU：{GPU_DEVICE_NAME}" if GPU_AVAILABLE else "GPU：未检测到可用设备")
             self.upd_log("GPU算法：已加载" if gpu_algorithm_available() else "GPU算法：未加载")
             self.upd_log("CPU驱动：已加载" if cpu_algorithm_available() else "CPU驱动：未加载")
             if not gpu_algorithm_available() and not cpu_algorithm_available():
@@ -2507,9 +2363,7 @@ class SlimeApp(QWidget):
         except Exception:
             return QColor(96, 96, 96, 255)
 
-        cache = getattr(self, "_floor_block_color_cache", None)
-        if cache is None:
-            self._floor_block_color_cache = cache = {}
+        cache = self._floor_block_color_cache
         cached = cache.get(key)
         if cached is not None:
             return cached
@@ -2640,14 +2494,14 @@ class SlimeApp(QWidget):
         # Ignore the old 1%-34% numeric signals while the native scan is in
         # indeterminate mode. These are exactly what made the bar appear stuck at
         # 2%. The first real post-scan stage (35%+) restores normal percent mode.
-        if bool(getattr(self, "_progress_busy", False)):
+        if self._progress_busy:
             if value in (0, 100) or value >= 35:
                 self._set_progress_busy(False)
             else:
                 return
         # During a running search, queued older progress signals must not pull
         # the bar back after a newer stage has already moved it forward.
-        if bool(getattr(self, "_search_in_progress", False)) and value not in (0, 100):
+        if self._search_in_progress and value not in (0, 100):
             if value < self.progress.value():
                 return
         self.progress.setValue(value)
@@ -2663,73 +2517,83 @@ class SlimeApp(QWidget):
 
     def _on_search_done(self, state):
         self._apply_run_state(state)
-        self.top_50_results = state.get("ranked_results", state.get("top_50_results", []))
+        self.top_50_results = state.get("ranked_results", [])
         self._refresh_rank_controls()
         if self.current_seed is not None: self.proj_manual_seed.setText(str(self.current_seed))
         if self.main_pos is not None:
             self.proj_manual_x.setText(str(self.main_pos[0]))
             self.proj_manual_z.setText(str(self.main_pos[1]))
+        self.proj_manual_y.setText("" if self.current_afk_y is None else str(self.current_afk_y))
         self.trigger_floor_preview_update()
         self._save_search_history(state)
 
     def _refresh_rank_controls(self):
-        results = list(getattr(self, "top_50_results", []) or [])
+        results = self.top_50_results
         count = len(results)
-        if not hasattr(self, "rank_select_spin"):
-            return
         enabled = count > 0
         self.rank_select_spin.setEnabled(enabled)
         self.rank_select_spin.setRange(1, max(1, count))
         if enabled:
             self.rank_select_spin.setValue(min(max(1, self.rank_select_spin.value()), count))
             self.result_status_label.setText(f"已保留 {count} 个排名结果 · 当前使用 #1")
-            first = results[0]
-            self._update_rank_detail(first)
+            self._update_rank_detail(results[0])
         else:
             self.rank_select_spin.setValue(1)
             self.result_status_label.setText("尚未产生排名结果")
             self.rank_detail_label.setText("搜索完成后，可直接选择第 1～N 名作为当前坐标和地板投影中心。")
-        for name in ("rank_apply_btn", "rank_list_btn", "rank_export_btn"):
-            widget = getattr(self, name, None)
-            if widget is not None:
-                widget.setEnabled(enabled)
-        if hasattr(self, "rank_toggle_btn"):
-            self.rank_toggle_btn.setEnabled(enabled)
+        self.rank_apply_btn.setEnabled(enabled)
+        self.rank_list_btn.setEnabled(enabled)
+        self.rank_export_btn.setEnabled(enabled)
+        self.rank_toggle_btn.setEnabled(enabled)
 
     def _toggle_rank_panel(self):
-        if not hasattr(self, "rank_panel"):
-            return
         expanded = not self.rank_panel.isVisible()
         self.rank_panel.setVisible(expanded)
-        if hasattr(self, "rank_toggle_btn"):
-            self.rank_toggle_btn.setText("收起排名" if expanded else "查看排名")
+        self.rank_toggle_btn.setText("收起排名" if expanded else "查看排名")
 
     def _update_rank_detail(self, entry):
-        if not entry or not hasattr(self, "rank_detail_label"):
+        if not entry:
             return
         rank, seed, size, obs, bx, bz, ay = entry[:7]
         obs_text = "未计算" if obs is None else str(obs)
         y_text = "未扫描" if ay is None else str(ay)
+        extra = " · 我知道这是第一名" if rank == 1 and getattr(self, "_rank_one_easter_active", False) else ""
         self.rank_detail_label.setText(
             f"#{rank} · 种子 {seed} · 规模 {size} · 刷怪格数 {obs_text} · "
-            f"主世界 ({bx}, {y_text}, {bz}) · 地狱 ({bx // 8}, {bz // 8})")
+            f"主世界 ({bx}, {y_text}, {bz}) · 地狱 ({bx // 8}, {bz // 8}){extra}")
+
+    def _apply_rank_from_button(self):
+        if self.rank_select_spin.value() == 1 and self.top_50_results:
+            self._rank_one_apply_count += 1
+            if self._rank_one_apply_count >= 7:
+                self._rank_one_apply_count = 0
+                self._rank_one_easter_active = True
+                QTimer.singleShot(3500, self._clear_rank_one_easter)
+        self.apply_ranked_result()
+
+    def _clear_rank_one_easter(self):
+        self._rank_one_easter_active = False
+        if self.top_50_results and self.rank_select_spin.value() == 1:
+            self._update_rank_detail(self.top_50_results[0])
+
+    def _record_ranking_double_click(self, entry):
+        key = (entry[1], entry[4], entry[5])
+        count = self._ranking_double_click_counts.get(key, 0) + 1
+        if count >= 5:
+            self._ranking_double_click_counts[key] = 0
+            self.upd_log("我知道你喜欢这个")
+        else:
+            self._ranking_double_click_counts[key] = count
 
     def preview_ranked_result(self, rank):
-        results = list(getattr(self, "top_50_results", []) or [])
+        results = self.top_50_results
         if not results:
             return
         rank = max(1, min(len(results), int(rank)))
         self._update_rank_detail(results[rank - 1])
 
-    def _step_rank_result(self, delta):
-        if not getattr(self, "top_50_results", None):
-            return
-        value = max(1, min(self.rank_select_spin.maximum(), self.rank_select_spin.value() + int(delta)))
-        self.rank_select_spin.setValue(value)
-        self.apply_ranked_result()
-
     def apply_ranked_result(self, rank=None):
-        results = list(getattr(self, "top_50_results", []) or [])
+        results = self.top_50_results
         if not results:
             return
         if rank is None:
@@ -2746,11 +2610,11 @@ class SlimeApp(QWidget):
         self.nether_pos = (bx // 8, bz // 8)
         self.result_status_label.setText(f"已保留 {len(results)} 个排名结果 · 当前使用 #{rank}")
         self._update_rank_detail(entry)
-        if hasattr(self, "proj_manual_seed"):
-            self.proj_manual_seed.setText(str(seed))
-            self.proj_manual_x.setText(str(bx))
-            self.proj_manual_z.setText(str(bz))
-            self.trigger_floor_preview_update()
+        self.proj_manual_seed.setText(str(seed))
+        self.proj_manual_x.setText(str(bx))
+        self.proj_manual_z.setText(str(bz))
+        self.proj_manual_y.setText("" if ay is None else str(ay))
+        self.trigger_floor_preview_update()
         obs_text = "未计算(快速模式)" if obs is None else str(obs)
         y_text = f", 挂机Y: {ay}" if ay is not None else ""
         self.info.setText(
@@ -2758,21 +2622,21 @@ class SlimeApp(QWidget):
             f"主世界: ({bx}, {bz}){y_text} | 地狱: ({bx // 8}, {bz // 8})")
         self.upd_log(f"已切换到排名 #{rank}：种子 {seed}，坐标 ({bx}, {bz})。")
 
-        self._rank_render_token = getattr(self, "_rank_render_token", 0) + 1
+        self._rank_render_token += 1
         token = self._rank_render_token
         def render_selected():
             try:
                 os.makedirs(os.path.join(APP_DIR, "images"), exist_ok=True)
                 dest = os.path.join(APP_DIR, "images", f"rank_{rank}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png")
                 create_slime_map(seed, bx, bz, dest)
-                if token == getattr(self, "_rank_render_token", None):
+                if token == self._rank_render_token:
                     self.c.i.emit(dest)
             except Exception as e:
                 self.c.l.emit(f"排名 #{rank} 图片生成失败: {e}")
         threading.Thread(target=render_selected, daemon=True).start()
 
     def show_rankings_dialog(self):
-        results = list(getattr(self, "top_50_results", []) or [])
+        results = self.top_50_results
         if not results:
             self.upd_log("当前没有排名结果。")
             return
@@ -2846,7 +2710,12 @@ class SlimeApp(QWidget):
             table.selectRow(rank - 1)
             table.scrollToItem(table.item(rank - 1, 0), QAbstractItemView.ScrollHint.PositionAtCenter)
 
-        table.cellDoubleClicked.connect(use_row)
+        def on_double_clicked(row, col):
+            if 0 <= row < len(results):
+                self._record_ranking_double_click(results[row])
+            use_row(row, col)
+
+        table.cellDoubleClicked.connect(on_double_clicked)
         use_btn.clicked.connect(lambda: use_row())
         jump_btn.clicked.connect(jump_to_rank)
         jump.returnPressed.connect(jump_to_rank)
@@ -2867,13 +2736,13 @@ class SlimeApp(QWidget):
         self._gpu_perf_total_work_ns = 0
 
     def _sample_gpu_perf(self, lib):
-        if not lib or not hasattr(lib, "get_processed_centers") or not hasattr(lib, "get_gpu_scan_work_ns"):
+        if not lib:
             return None
         try:
             centers = max(0, int(lib.get_processed_centers()))
             work_ns = max(0, int(lib.get_gpu_scan_work_ns()))
-            prev_centers = int(getattr(self, "_gpu_perf_prev_centers", 0))
-            prev_work_ns = int(getattr(self, "_gpu_perf_prev_work_ns", 0))
+            prev_centers = self._gpu_perf_prev_centers
+            prev_work_ns = self._gpu_perf_prev_work_ns
             delta_centers = centers - prev_centers
             delta_work_ns = work_ns - prev_work_ns
             self._gpu_perf_prev_centers = centers
@@ -2886,14 +2755,14 @@ class SlimeApp(QWidget):
                     self._gpu_perf_samples.append(rate_b)
                     return rate_b
         except Exception:
-            pass
+            return None
         return None
 
     def _finish_gpu_perf_stats(self, lib):
         self._sample_gpu_perf(lib)
-        samples = list(getattr(self, "_gpu_perf_samples", []))
-        total_centers = int(getattr(self, "_gpu_perf_total_centers", 0))
-        total_work_ns = int(getattr(self, "_gpu_perf_total_work_ns", 0))
+        samples = self._gpu_perf_samples
+        total_centers = self._gpu_perf_total_centers
+        total_work_ns = self._gpu_perf_total_work_ns
         if not samples or total_centers <= 0 or total_work_ns <= 0:
             return None
         peak_b = max(samples)
@@ -2916,20 +2785,17 @@ class SlimeApp(QWidget):
             self._set_progress_busy(True)
         else:
             self._set_progress_busy(False)
-            try:
-                if label == "GPU" and hasattr(self, "gpu_perf_label") and not getattr(self, "_search_cancelled", False):
-                    stats = self._finish_gpu_perf_stats(lib)
-                    gpu_short_name = GPU_DEVICE_NAME.replace("NVIDIA GeForce ", "").replace("NVIDIA ", "").strip()
-                    if stats:
-                        low_b, avg_b, peak_b = stats
-                        self.gpu_perf_label.setText(f"{gpu_short_name} · {avg_b:.1f} B/s")
-                        self.upd_log(
-                            f"GPU速度统计：峰值 {peak_b:.2f} B/s | 最低 {low_b:.2f} B/s | 平均 {avg_b:.2f} B/s")
-                done_value = int(min(95, self._native_scan_base_pct + 35 / max(1, self._native_scan_total_seeds)))
-                if done_value > self.progress.value():
-                    self.progress.setValue(done_value)
-            except Exception:
-                pass
+            if label == "GPU" and not self._search_cancelled:
+                stats = self._finish_gpu_perf_stats(lib)
+                gpu_short_name = GPU_DEVICE_NAME.replace("NVIDIA GeForce ", "").replace("NVIDIA ", "").strip()
+                if stats:
+                    low_b, avg_b, peak_b = stats
+                    self._set_gpu_perf_text(f"{gpu_short_name} · {avg_b:.1f} B/s")
+                    self.upd_log(
+                        f"GPU速度统计：峰值 {peak_b:.2f} B/s | 最低 {low_b:.2f} B/s | 平均 {avg_b:.2f} B/s")
+            done_value = int(min(95, self._native_scan_base_pct + 35 / max(1, self._native_scan_total_seeds)))
+            if done_value > self.progress.value():
+                self.progress.setValue(done_value)
 
     def poll_native_progress(self):
         """Main-thread liveness progress for long searches.
@@ -2938,74 +2804,66 @@ class SlimeApp(QWidget):
         state signal arrives. It only raises the bar inside the first scan stage
         and never claims final completion.
         """
-        try:
-            active = bool(getattr(self, "_native_scan_active", False))
-            running = bool(getattr(self, "_search_in_progress", False))
-            if not active and not running:
-                return
-            if bool(getattr(self, "_search_paused", False)):
-                label = getattr(self, "_native_scan_label", "搜索")
-                self.time_label.setText(f"{label} 已暂停 · 点击“继续”恢复")
-                return
+        active = self._native_scan_active
+        if not active and not self._search_in_progress:
+            return
+        if self._search_paused:
+            self.time_label.setText(f"{self._native_scan_label} 已暂停 · 点击“继续”恢复")
+            return
 
-            if active:
-                started = float(getattr(self, "_native_scan_started", time.time()))
-                base_pct = float(getattr(self, "_native_scan_base_pct", 0.0))
-                total_seeds = max(1.0, float(getattr(self, "_native_scan_total_seeds", 1.0)))
-                label = getattr(self, "_native_scan_label", "原生")
-                lib = getattr(self, "_native_scan_lib", None)
-            else:
-                # Global fallback: start_work() has definitely run, but the
-                # native-state signal has not arrived yet. This is the exact
-                # case that made the bar stick at 2% on large scans.
-                started = float(getattr(self, "_search_started_at", time.time()))
-                base_pct = 0.0
-                total_seeds = 1.0
-                label = "搜索"
-                lib = None
+        if active:
+            started = self._native_scan_started
+            base_pct = self._native_scan_base_pct
+            total_seeds = float(self._native_scan_total_seeds)
+            label = self._native_scan_label
+            lib = self._native_scan_lib
+        else:
+            started = self._search_started_at
+            base_pct = 0.0
+            total_seeds = 1.0
+            label = "搜索"
+            lib = None
 
-            elapsed = max(0.001, time.time() - started - float(getattr(self, "_native_pause_accum", 0.0)))
-            native_pct = None
-            if lib and hasattr(lib, "get_progress"):
-                try:
-                    raw_pct = int(lib.get_progress())
-                    if 0 <= raw_pct <= 100:
-                        native_pct = raw_pct
-                except Exception:
-                    native_pct = None
+        elapsed = max(0.001, time.time() - started - self._native_pause_accum)
+        native_pct = None
+        if lib:
+            try:
+                raw_pct = int(lib.get_progress())
+                if 0 <= raw_pct <= 100:
+                    native_pct = raw_pct
+            except Exception:
+                native_pct = None
 
-            if native_pct is not None and native_pct > 0:
-                phase = 2 + int(min(33, max(0, native_pct) * 33 / 100))
-            else:
-                phase = 2 + int((1.0 - math.exp(-elapsed / 45.0)) * 31)
-                if elapsed >= 1.0:
-                    phase = max(3, phase)
-                phase = min(int(getattr(self, "_search_soft_ceiling", 34)), max(2, phase))
+        if native_pct is not None and native_pct > 0:
+            phase = 2 + int(min(33, native_pct * 33 / 100))
+        else:
+            phase = 2 + int((1.0 - math.exp(-elapsed / 45.0)) * 31)
+            if elapsed >= 1.0:
+                phase = max(3, phase)
+            phase = min(self._search_soft_ceiling, max(2, phase))
 
-            value = int(max(0, min(95, base_pct + phase / total_seeds)))
-            if elapsed >= 1.0 and self.progress.value() < 35:
-                value = max(value, min(34, phase))
-            if not bool(getattr(self, "_progress_busy", False)) and value > self.progress.value():
-                self.progress.setValue(value)
+        value = int(max(0, min(95, base_pct + phase / total_seeds)))
+        if elapsed >= 1.0 and self.progress.value() < 35:
+            value = max(value, min(34, phase))
+        if not self._progress_busy and value > self.progress.value():
+            self.progress.setValue(value)
 
-            if label == "GPU" and hasattr(self, "gpu_perf_label"):
-                gpu_short_name = GPU_DEVICE_NAME.replace("NVIDIA GeForce ", "").replace("NVIDIA ", "").strip()
-                rate_b = self._sample_gpu_perf(lib)
-                if rate_b is not None and rate_b > 0:
-                    self.gpu_perf_label.setText(f"{gpu_short_name} · {rate_b:.1f} B/s")
+        if label == "GPU":
+            gpu_short_name = GPU_DEVICE_NAME.replace("NVIDIA GeForce ", "").replace("NVIDIA ", "").strip()
+            rate_b = self._sample_gpu_perf(lib)
+            if rate_b is not None and rate_b > 0:
+                self._set_gpu_perf_text(f"{gpu_short_name} · {rate_b:.1f} B/s")
 
-            elapsed_text = format_elapsed(elapsed)
-            if native_pct is not None and native_pct > 0:
-                self.time_label.setText(f"{label} 扫描中：{native_pct}% | 已用时 {elapsed_text}")
-            else:
-                self.time_label.setText(f"{label} 扫描中：已用时 {elapsed_text}")
-        except Exception:
-            # Keep the UI alive; errors here are non-fatal and should not spam logs.
-            pass
+        elapsed_text = format_elapsed(elapsed)
+        if native_pct is not None and native_pct > 0:
+            self.time_label.setText(f"{label} 扫描中：{native_pct}% | 已用时 {elapsed_text}")
+        else:
+            self.time_label.setText(f"{label} 扫描中：已用时 {elapsed_text}")
 
     def initUI(self):
         self.setWindowTitle(f'查找史莱姆区块 {APP_VERSION}')
-        self.setFixedSize(1200, 780)
+        self.resize(1200, 780)
+        self.setMinimumSize(960, 640)
         self.setStyleSheet("""
             QWidget { background: #1a1a1a; color: #e0e0e0; font-family: 'Microsoft YaHei', Arial; }
             QLineEdit, QTextEdit, QSpinBox, QComboBox { background: #2a2a2a; border: 1px solid #3a3a3a; border-radius: 4px; padding: 6px; color: #ffffff; font-size: 12px; }
@@ -3059,6 +2917,7 @@ class SlimeApp(QWidget):
 
         icon_slime = create_slime_icon()
         icon_shared = create_fluent_icon()
+        icon_history = create_history_icon()
         icon_gear = create_gear_icon()
 
         self.btn_nav_search = QPushButton()
@@ -3070,6 +2929,11 @@ class SlimeApp(QWidget):
         self.btn_nav_floor.setIcon(icon_shared)
         self.btn_nav_floor.setIconSize(QSize(24, 24))
         self.btn_nav_floor.setText("  地板生成")
+
+        self.btn_history = QPushButton()
+        self.btn_history.setIcon(icon_history)
+        self.btn_history.setIconSize(QSize(24, 24))
+        self.btn_history.setText("  历史记录")
 
         self.btn_nav_settings = QPushButton()
         self.btn_nav_settings.setIcon(icon_gear)
@@ -3086,7 +2950,9 @@ class SlimeApp(QWidget):
         self.btn_nav_search.setChecked(True)
 
         sidebar_layout.addStretch()
+        sidebar_layout.addWidget(self.btn_history)
         sidebar_layout.addWidget(self.btn_nav_settings)
+        self.btn_history.clicked.connect(self.show_history)
         self.btn_nav_settings.clicked.connect(self.open_settings)
 
         global_layout.addWidget(self.sidebar)
@@ -3098,6 +2964,20 @@ class SlimeApp(QWidget):
         self.nav_group.idClicked.connect(self.on_nav_changed)
 
     def toggle_sidebar(self):
+        now = time.monotonic()
+        self._hamburger_click_times = [t for t in self._hamburger_click_times if now - t <= 4.0]
+        self._hamburger_click_times.append(now)
+        if len(self._hamburger_click_times) >= 8:
+            self._hamburger_click_times.clear()
+            self.btn_hamburger.setToolTip("门没坏")
+            try:
+                QToolTip.showText(
+                    self.btn_hamburger.mapToGlobal(self.btn_hamburger.rect().bottomRight()),
+                    "门没坏", self.btn_hamburger)
+            except Exception:
+                pass
+            QTimer.singleShot(3000, lambda: self.btn_hamburger.setToolTip(""))
+
         self.is_sidebar_expanded = not self.is_sidebar_expanded
         start_w = self.sidebar.width()
         end_w = 200 if self.is_sidebar_expanded else 60
@@ -3115,10 +2995,12 @@ class SlimeApp(QWidget):
         if self.is_sidebar_expanded:
             self.btn_nav_search.setText("  搜索界面")
             self.btn_nav_floor.setText("  地板生成")
+            self.btn_history.setText("  历史记录")
             self.btn_nav_settings.setText("  高级设置")
         else:
             self.btn_nav_search.setText("")
             self.btn_nav_floor.setText("")
+            self.btn_history.setText("")
             self.btn_nav_settings.setText("")
 
         self.sidebar_anim.start()
@@ -3126,9 +3008,6 @@ class SlimeApp(QWidget):
 
     def on_nav_changed(self, page_id):
         self.stacked.setCurrentIndex(page_id)
-
-    def open_settings_dialog(self):
-        self.open_settings()
 
     def setup_search_page(self):
         page = QWidget()
@@ -3167,12 +3046,12 @@ class SlimeApp(QWidget):
         center_h = QHBoxLayout()
         center_x_v = QVBoxLayout()
         center_x_v.addWidget(QLabel("搜索中心 X (方块):"))
-        self.search_center_x_input = QLineEdit(str(getattr(self.config, 'search_center_x', 0)))
+        self.search_center_x_input = QLineEdit(str(self.config.search_center_x))
         center_x_v.addWidget(self.search_center_x_input)
         center_h.addLayout(center_x_v)
         center_z_v = QVBoxLayout()
         center_z_v.addWidget(QLabel("搜索中心 Z (方块):"))
-        self.search_center_z_input = QLineEdit(str(getattr(self.config, 'search_center_z', 0)))
+        self.search_center_z_input = QLineEdit(str(self.config.search_center_z))
         center_z_v.addWidget(self.search_center_z_input)
         center_h.addLayout(center_z_v)
         left_v.addLayout(center_h)
@@ -3200,18 +3079,24 @@ class SlimeApp(QWidget):
 
         self.chk_dd = QCheckBox(" 检测是否有深谙之域")
         self.chk_dd.setChecked(bool(cb))
+        self.cubiomes_download_btn = QPushButton("下载噪声检查组件")
+        self.cubiomes_download_btn.setToolTip("打开 cubiomes 上游源码页面；组件保持外置，不打包进本程序 EXE。")
+        self.cubiomes_download_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(CUBIOMES_DOWNLOAD_URL)))
+        self.cubiomes_download_btn.setVisible(not bool(cb))
         if not cb:
             self.chk_dd.setEnabled(False)
-            self.chk_dd.setText("cubiomes.dll 未加载（详情见日志）")
-            self.chk_dd.setToolTip(DLL_ERROR_MSG)
+            self.chk_dd.setText("噪声/群系检查未安装")
+            self.chk_dd.setToolTip(DLL_ERROR_MSG + "\n下载/源码：" + CUBIOMES_DOWNLOAD_URL)
         left_v.addWidget(self.chk_dd)
+        left_v.addWidget(self.cubiomes_download_btn)
 
         self.chk_precise_afk = QCheckBox(" 精准挂机点")
-        self.chk_precise_afk.setChecked(getattr(self.config, 'precise_afk', True))
+        self.chk_precise_afk.setChecked(self.config.precise_afk)
         left_v.addWidget(self.chk_precise_afk)
 
         self.chk_scan_y = QCheckBox(" 扫描挂机Y")
-        self.chk_scan_y.setChecked(getattr(self.config, 'scan_y', False))
+        self.chk_scan_y.setChecked(self.config.scan_y)
         self.chk_scan_y.setEnabled(self.chk_precise_afk.isChecked())
         self.chk_precise_afk.toggled.connect(self.chk_scan_y.setEnabled)
         left_v.addWidget(self.chk_scan_y)
@@ -3225,7 +3110,7 @@ class SlimeApp(QWidget):
         if cpu_algorithm_available():
             self.engine_combo.addItem("CPU (AVX2/OpenMP)")
 
-        idx = self.engine_combo.findText(getattr(self.config, 'selected_engine', 'Auto'))
+        idx = self.engine_combo.findText(self.config.selected_engine)
         if idx >= 0:
             self.engine_combo.setCurrentIndex(idx)
         engine_h.addWidget(self.engine_combo)
@@ -3257,8 +3142,14 @@ class SlimeApp(QWidget):
         self.progress.setFixedHeight(15)
         progress_h.addWidget(self.progress, 1)
         gpu_short_name = GPU_DEVICE_NAME.replace("NVIDIA GeForce ", "").replace("NVIDIA ", "").strip()
-        self.gpu_perf_label = QLabel(f"{gpu_short_name} · -- B/s")
-        self.gpu_perf_label.setStyleSheet("color: #7f8a96; font-size: 10px;")
+        self.gpu_perf_label = QPushButton(f"{gpu_short_name} · -- B/s")
+        self.gpu_perf_label.setFlat(True)
+        self.gpu_perf_label.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.gpu_perf_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.gpu_perf_label.setStyleSheet(
+            "QPushButton { background: transparent; border: none; padding: 0; color: #7f8a96; font-size: 10px; }"
+            "QPushButton:hover { color: #9aa5b1; }")
+        self.gpu_perf_label.clicked.connect(self._on_gpu_perf_click)
         self.gpu_perf_label.setVisible(gpu_algorithm_available())
         progress_h.addWidget(self.gpu_perf_label, 0)
         left_v.addLayout(progress_h)
@@ -3295,6 +3186,7 @@ class SlimeApp(QWidget):
         self.rank_select_spin.setRange(1, 1)
         self.rank_select_spin.setValue(1)
         self.rank_select_spin.setEnabled(False)
+        self.rank_select_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.rank_select_spin.setFixedWidth(82)
         rank_actions.addWidget(self.rank_select_spin)
         rank_actions.addWidget(QLabel("名"))
@@ -3304,7 +3196,7 @@ class SlimeApp(QWidget):
         self.rank_export_btn = QPushButton("导出 CSV")
         for b in (self.rank_apply_btn, self.rank_list_btn, self.rank_export_btn):
             b.setEnabled(False)
-        self.rank_apply_btn.clicked.connect(self.apply_ranked_result)
+        self.rank_apply_btn.clicked.connect(self._apply_rank_from_button)
         self.rank_list_btn.clicked.connect(self.show_rankings_dialog)
         self.rank_export_btn.clicked.connect(self.export_results)
         self.rank_select_spin.valueChanged.connect(self.preview_ranked_result)
@@ -3378,6 +3270,7 @@ class SlimeApp(QWidget):
 
         self.stacked.addWidget(page)
 
+    # ===== 投影界面 =====
     def setup_floor_page(self):
         tab_gen = QWidget()
         gen_layout = QHBoxLayout(tab_gen)
@@ -3404,6 +3297,8 @@ class SlimeApp(QWidget):
         self.proj_manual_x.setPlaceholderText("默认使用最优坐标 X")
         self.proj_manual_z = QLineEdit()
         self.proj_manual_z.setPlaceholderText("默认使用最优坐标 Z")
+        self.proj_manual_y = QLineEdit()
+        self.proj_manual_y.setPlaceholderText("默认使用扫描到的挂机Y；无结果时 -64")
         self.px = QLineEdit("280")
         self.pz = QLineEdit("280")
 
@@ -3441,6 +3336,7 @@ class SlimeApp(QWidget):
         basic_form.addRow("世界种子:", self.proj_manual_seed)
         basic_form.addRow("中心坐标 X:", self.proj_manual_x)
         basic_form.addRow("中心坐标 Z:", self.proj_manual_z)
+        basic_form.addRow("挂机坐标 Y:", self.proj_manual_y)
         basic_form.addRow("总宽度 (X):", self.px)
         basic_form.addRow("总长度 (Z):", self.pz)
         basic_form.addRow("非史莱姆区材质:", self.proj_glass_stack)
@@ -3499,9 +3395,12 @@ class SlimeApp(QWidget):
         right_preview_v = QVBoxLayout(right_preview_panel)
         right_preview_v.setContentsMargins(15, 15, 15, 15)
 
-        preview_title = QLabel("地板俯视范围动态预演")
-        preview_title.setStyleSheet("font-size: 13px; font-weight: bold; color: #aaa;")
-        right_preview_v.addWidget(preview_title)
+        self.floor_preview_title = QPushButton("地板俯视范围动态预演")
+        self.floor_preview_title.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.floor_preview_title.setStyleSheet("QPushButton { background: transparent; border: none; padding: 0; text-align: left; font-size: 13px; font-weight: bold; color: #aaa; } QPushButton:hover { color: #bbb; }")
+        self._projection_title_click_times = []
+        self.floor_preview_title.clicked.connect(self._on_projection_title_click)
+        right_preview_v.addWidget(self.floor_preview_title)
 
         self.floor_scroller = QScrollArea()
         self.floor_scroller.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3515,7 +3414,7 @@ class SlimeApp(QWidget):
         gen_layout.addWidget(right_preview_panel, 1)
 
         # 绑定触发机制
-        for w in [self.proj_manual_seed, self.proj_manual_x, self.proj_manual_z, self.px, self.pz, self.proj_custom_block]:
+        for w in [self.proj_manual_seed, self.proj_manual_x, self.proj_manual_z, self.proj_manual_y, self.px, self.pz, self.proj_custom_block]:
             w.textChanged.connect(self.trigger_floor_preview_update)
         for w in [self.proj_glass, self.wither_base_combo, self.portal_axis_combo]:
             w.currentIndexChanged.connect(self.trigger_floor_preview_update)
@@ -3525,19 +3424,15 @@ class SlimeApp(QWidget):
         self.stacked.addWidget(tab_gen)
         QTimer.singleShot(500, self.trigger_floor_preview_update)
 
-    def collect_projection_settings(self):
-        """Capture every option that changes preview/export output.
 
-        History is written on the GUI thread after a result arrives, so the
-        snapshot also includes edits made on the projection page while a long
-        native search was running.
-        """
-        if not hasattr(self, "px"):
-            return {}
+
+
+    def collect_projection_settings(self):
         return {
             "schema": 1,
             "width_x": self.px.text().strip(),
             "length_z": self.pz.text().strip(),
+            "afk_y": self.proj_manual_y.text().strip(),
             "glass_name": self.proj_glass.currentText(),
             "custom_material_enabled": self.chk_custom_floor_material.isChecked(),
             "custom_material": self.proj_custom_block.text().strip(),
@@ -3553,14 +3448,14 @@ class SlimeApp(QWidget):
         }
 
     def apply_projection_settings(self, settings):
-        """Restore a history projection snapshot; old history remains valid."""
         if not isinstance(settings, dict) or not settings:
             return
         if settings.get("width_x") not in (None, ""):
             self.px.setText(str(settings["width_x"]))
         if settings.get("length_z") not in (None, ""):
             self.pz.setText(str(settings["length_z"]))
-
+        if settings.get("afk_y") not in (None, ""):
+            self.proj_manual_y.setText(str(settings["afk_y"]))
         glass_name = settings.get("glass_name")
         if glass_name:
             idx = self.proj_glass.findText(str(glass_name))
@@ -3570,7 +3465,6 @@ class SlimeApp(QWidget):
         self.chk_custom_floor_material.setChecked(bool(settings.get("custom_material_enabled", False)))
         self.wither_base_combo.setCurrentIndex(clamp_int(settings.get("wither_base_index", 0), 0, 0, self.wither_base_combo.count() - 1))
         self.portal_axis_combo.setCurrentIndex(clamp_int(settings.get("portal_axis_index", 0), 0, 0, self.portal_axis_combo.count() - 1))
-
         for key, widget, default in (
             ("magma", self.chk_magma, True),
             ("wither_rose", self.chk_wither, True),
@@ -3582,9 +3476,10 @@ class SlimeApp(QWidget):
             widget.setChecked(bool(settings.get(key, default)))
         self.trigger_floor_preview_update()
 
+    # ===== 历史记录 =====
     def _save_search_history(self, state):
         timestamp = state.get("history_timestamp")
-        if not timestamp or state.get("_history_saved"):
+        if not timestamp:
             return
         try:
             os.makedirs(os.path.join(APP_DIR, "history"), exist_ok=True)
@@ -3597,22 +3492,17 @@ class SlimeApp(QWidget):
                 "seed": state.get("current_seed"),
                 "size": state.get("current_size"),
                 "obs_count": state.get("current_obs_count"),
-                "x": x,
-                "y": state.get("current_afk_y"),
-                "z": z,
-                "nether_x": nx,
-                "nether_z": nz,
+                "x": x, "y": state.get("current_afk_y"), "z": z,
+                "nether_x": nx, "nether_z": nz,
                 "image": state.get("history_image", ""),
                 "algorithm": state.get("current_algorithm", "未知算法"),
                 "search_params": state.get("search_params", {}),
-                "ranked_results": state.get("ranked_results", state.get("top_50_results", [])),
+                "ranked_results": state.get("ranked_results", []),
                 "projection": self.collect_projection_settings(),
             }
-            history_path = os.path.join(APP_DIR, "history", f"search_{timestamp}.json")
-            with open(history_path, "w", encoding="utf-8") as f:
+            path = os.path.join(APP_DIR, "history", f"search_{timestamp}.json")
+            with open(path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
-            state["_history_saved"] = True
-            self.upd_log("历史记录已同步：搜索参数、算法版本和投影参数均已保存。")
         except Exception as e:
             self.upd_log(f"历史记录保存失败：{e}")
 
@@ -3623,9 +3513,130 @@ class SlimeApp(QWidget):
         self._floor_timer.timeout.connect(self.generate_floor_preview_bitmap)
         self._floor_timer.start(250)
 
+    def _projection_seed_easter_egg_active(self, seed_input=None):
+        seed_input = self.proj_manual_seed.text().strip() if seed_input is None else str(seed_input).strip()
+        if not seed_input or not is_minecraft_text_seed(seed_input):
+            return False
+        return not any(w.text().strip() for w in (
+            self.proj_manual_x, self.proj_manual_z, self.proj_manual_y))
+
+    def _on_projection_title_click(self):
+        now = time.monotonic()
+        self._projection_title_click_times = [
+            t for t in self._projection_title_click_times if now - t <= 2.5]
+        self._projection_title_click_times.append(now)
+        if len(self._projection_title_click_times) >= 7:
+            self._projection_title_click_times.clear()
+            self.upd_log("这也能被你找到？")
+
+    def _reject_world_border_radius(self, radius):
+        if radius <= WORLD_BORDER_RADIUS_CHUNKS:
+            return False
+
+        first = QMessageBox(self)
+        first.setIcon(QMessageBox.Icon.Warning)
+        first.setWindowTitle("你在干什么？？？")
+        first.setText(
+            f"搜索半径是 {radius:,} 个区块。\n\n"
+            f"这已经超过 {WORLD_BORDER_RADIUS_CHUNKS:,} 区块的世界边界尺度。"
+        )
+        first.addButton("……", QMessageBox.ButtonRole.AcceptRole)
+        first.exec()
+
+        second = QMessageBox(self)
+        second.setIcon(QMessageBox.Icon.Critical)
+        second.setWindowTitle("不对劲")
+        second.setText(
+            "这个范围对正常主世界搜索没有实际意义，继续执行只会浪费大量时间和资源。"
+        )
+        second.addButton("我知道了", QMessageBox.ButtonRole.AcceptRole)
+        second.exec()
+
+        third = QMessageBox(self)
+        third.setIcon(QMessageBox.Icon.Information)
+        third.setWindowTitle("拒绝执行")
+        third.setText(
+            f"请把最大搜索半径改到 {WORLD_BORDER_RADIUS_CHUNKS:,} 区块以内。"
+        )
+        third.addButton("行吧", QMessageBox.ButtonRole.AcceptRole)
+        third.exec()
+        return True
+
+    def _show_projection_seed_easter_egg(self, resolved_seed):
+        QTimer.singleShot(0, lambda seed=resolved_seed: self._render_projection_seed_easter_egg(seed))
+
+    def _render_projection_seed_easter_egg(self, resolved_seed):
+        current = self.proj_manual_seed.text().strip()
+        if not self._projection_seed_easter_egg_active(current):
+            return
+        if normalize_java_seed(current) != resolved_seed:
+            return
+
+        viewport_w = max(1, self.floor_scroller.viewport().width() - 12)
+        img_w = max(520, viewport_w)
+        img_h = 310
+        block = 4
+        chars = "何意味"
+        gap = 18
+        char_w = max(120, min(190, (img_w - 64 - gap * 2) // 3))
+        char_h = 190
+        total_w = len(chars) * char_w + (len(chars) - 1) * gap
+        left = max(10, (img_w - total_w) // 2)
+        top = 12
+
+        img = QImage(img_w, img_h, QImage.Format.Format_ARGB32)
+        img.fill(QColor(24, 24, 26))
+        painter = QPainter(img)
+        fill = self.get_floor_block_color("minecraft:lime_stained_glass")
+        edge = QColor(fill)
+        edge.setAlpha(90)
+
+        glyph_font = QFont("Microsoft YaHei", max(88, int(char_w * 0.82)), QFont.Weight.Normal)
+        for index, char in enumerate(chars):
+            mask = QImage(char_w, char_h, QImage.Format.Format_Grayscale8)
+            mask.fill(0)
+            mp = QPainter(mask)
+            mp.setPen(QColor(255, 255, 255))
+            mp.setFont(glyph_font)
+            mp.drawText(mask.rect(), Qt.AlignmentFlag.AlignCenter, char)
+            mp.end()
+
+            base_x = left + index * (char_w + gap)
+            for gy in range(0, char_h, block):
+                for gx in range(0, char_w, block):
+                    hits = 0
+                    samples = 0
+                    for sy in range(gy, min(gy + block, char_h)):
+                        for sx in range(gx, min(gx + block, char_w)):
+                            samples += 1
+                            if mask.pixelColor(sx, sy).value() > 96:
+                                hits += 1
+                    if hits * 5 < samples:
+                        continue
+                    x = base_x + gx
+                    y = top + gy
+                    painter.fillRect(x + 1, y + 1, block - 1, block - 1, fill)
+                    painter.setPen(edge)
+                    painter.drawRect(x + 1, y + 1, block - 2, block - 2)
+
+        painter.setPen(QColor(145, 145, 150))
+        painter.setFont(QFont("Microsoft YaHei UI", 11))
+        painter.drawText(
+            20, 244, img_w - 40, 42,
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+            f"文本种子 · Minecraft 会自动转换为数字种子：{resolved_seed}")
+        painter.end()
+
+        self.floor_preview_label.clear()
+        self.floor_preview_label.setFixedSize(img_w, img_h)
+        self.floor_preview_label.setPixmap(QPixmap.fromImage(img))
+
     def generate_floor_preview_bitmap(self):
         try:
             seed_input = self.proj_manual_seed.text().strip()
+            if self._projection_seed_easter_egg_active(seed_input):
+                self._show_projection_seed_easter_egg(normalize_java_seed(seed_input))
+                return
             active_seed = normalize_java_seed(seed_input) if seed_input else self.current_seed
             if active_seed is None:
                 self.floor_preview_label.setText("主世界未完成检索且未手动覆盖种子，无法绘制演练蓝图")
@@ -3633,6 +3644,8 @@ class SlimeApp(QWidget):
 
             x_input = self.proj_manual_x.text().strip()
             z_input = self.proj_manual_z.text().strip()
+            y_input = self.proj_manual_y.text().strip()
+            oy = int(y_input) if y_input else -64
             if not x_input and not z_input:
                 if not self.main_pos:
                     self.floor_preview_label.setText("请输入中心坐标以初始化范围渲染")
@@ -3649,8 +3662,7 @@ class SlimeApp(QWidget):
                 ox = int(x_input) if x_input else int(base_x)
                 oz = int(z_input) if z_input else int(base_z)
 
-            sx = max(16, int(self.px.text() or 280))
-            sz = max(16, int(self.pz.text() or 280))
+            sx, sz = validate_projection_dimensions(self.px.text().strip(), self.pz.text().strip())
             glass = self.get_floor_material_id()
         except ValueError as e:
             try:
@@ -3684,10 +3696,10 @@ class SlimeApp(QWidget):
 
             use_magma = self.chk_magma.isChecked()
             use_wither = self.chk_wither.isChecked()
-            use_rod = getattr(self, "chk_rod", None) is not None and self.chk_rod.isChecked()
+            use_rod = self.chk_rod.isChecked()
             use_portal_array = self.chk_portal_array.isChecked()
-            show_slime_highlight = getattr(self, "chk_show_slime", None) is None or self.chk_show_slime.isChecked()
-            show_radius = getattr(self, "chk_show_radius", None) is None or self.chk_show_radius.isChecked()
+            show_slime_highlight = self.chk_show_slime.isChecked()
+            show_radius = self.chk_show_radius.isChecked()
             is_axis_x = self.portal_axis_combo.currentIndex() == 0
             wither_base_soul = self.wither_base_combo.currentIndex() == 1
 
@@ -3701,7 +3713,8 @@ class SlimeApp(QWidget):
                 return chunk_cache[key]
 
             _, _, start_x, start_z, distance_field = build_floor_distance_field(
-                ox, oz, render_sx, render_sz, is_slime_cached)
+                ox, oz, render_sx, render_sz, is_slime_cached,
+                afk_y=oy, platform_y=-64)
 
             def distance_to_slime(wx, wz):
                 return floor_distance_at(
@@ -3737,7 +3750,7 @@ class SlimeApp(QWidget):
                     if dist == 0:
                         painter.fillRect(rect_x, rect_y, rect_w, rect_h, self.get_floor_block_color("minecraft:nether_portal")if is_portal_position(wx, wz) else self.get_floor_block_color("minecraft:obsidian"))
                     elif dist == 1:
-                        painter.fillRect(rect_x, rect_y, rect_w, rect_h, self.get_floor_block_color("minecraft:orange_concrete") if use_magma else self.get_floor_block_color(glass))
+                        painter.fillRect(rect_x, rect_y, rect_w, rect_h, self.get_floor_block_color("minecraft:magma_block") if use_magma else self.get_floor_block_color(glass))
                     elif is_valid_bait(wx, wz):
                         painter.fillRect(rect_x, rect_y, rect_w, rect_h, self.get_floor_block_color(wither_base))
                         rose_w = max(1, rect_w // 2)
@@ -3765,11 +3778,18 @@ class SlimeApp(QWidget):
                 gz += 16
 
             if show_radius:
-                painter.setPen(QPen(QColor(120, 220, 255, 230), 2, Qt.PenStyle.DashLine))
+                painter.setPen(QPen(QColor(255, 50, 50, 230), 2, Qt.PenStyle.DashLine))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 cx_pix = draw_offset_x + (ox - start_x + 0.5) * scale_x
                 cz_pix = draw_offset_z + (oz - start_z + 0.5) * scale_z
-                painter.drawEllipse(QPointF(cx_pix, cz_pix), 128 * scale_x, 128 * scale_z)
+                dy = -64 - oy
+                outer_rem = SPAWN_OUTER_SQ - dy * dy
+                if outer_rem >= 0:
+                    horizontal_radius = math.sqrt(outer_rem)
+                    painter.drawEllipse(
+                        QPointF(cx_pix, cz_pix),
+                        horizontal_radius * scale_x,
+                        horizontal_radius * scale_z)
 
             painter.end()
             self.floor_preview_label.setFixedSize(img_w, img_h)
@@ -3799,16 +3819,21 @@ class SlimeApp(QWidget):
             QMessageBox.warning(self, "输入错误", "种子和坐标必须是整数。")
 
     def export_proj(self):
+        seed_input = self.proj_manual_seed.text().strip()
+        if self._projection_seed_easter_egg_active(seed_input):
+            self.upd_log("何意味")
+            self._show_projection_seed_easter_egg(normalize_java_seed(seed_input))
         if not HAS_LITEMAPY:
             QMessageBox.warning(self, "错误", "需要安装环境 litemapy")
             return
         try:
-            seed_input = self.proj_manual_seed.text().strip()
             active_seed = normalize_java_seed(seed_input) if seed_input else self.current_seed
             if active_seed is None:
                 QMessageBox.warning(self, "缺少参数", "请先搜索出结果，或手动填写世界种子。")
                 return
             x_i, z_i = self.proj_manual_x.text().strip(), self.proj_manual_z.text().strip()
+            y_i = self.proj_manual_y.text().strip()
+            oy = int(y_i) if y_i else -64
             if not x_i and not z_i:
                 if not self.main_pos:
                     QMessageBox.warning(self, "缺少参数", "请先搜索出最优坐标，或手动填写中心坐标 X/Z。")
@@ -3822,11 +3847,7 @@ class SlimeApp(QWidget):
                     raise ValueError("中心坐标 Z 为空，且没有可用的最优坐标。")
                 ox = int(x_i) if x_i else int(base_x)
                 oz = int(z_i) if z_i else int(base_z)
-            sx, sz = int(self.px.text()), int(self.pz.text())
-            if sx < 16 or sz < 16:
-                raise ValueError("总宽度和总长度必须至少为 16，避免预览与导出范围不一致。")
-            if sx > 4096 or sz > 4096:
-                raise ValueError("尺寸过大，最多建议 4096 x 4096；更大尺寸容易导致内存暴涨。")
+            sx, sz = validate_projection_dimensions(self.px.text().strip(), self.pz.text().strip())
             selected_floor_id = self.get_floor_material_id()
         except ValueError as e:
             QMessageBox.warning(self, "输入错误", str(e))
@@ -3834,12 +3855,17 @@ class SlimeApp(QWidget):
 
         fn, _ = QFileDialog.getSaveFileName(self, "保存地板投影", f"SlimePerimeter_{ox}_{oz}.litematic", "Litematica (*.litematic)")
         if not fn:
+            self._projection_save_cancel_count += 1
+            if self._projection_save_cancel_count >= 5:
+                self._projection_save_cancel_count = 0
+                self.upd_log("你到底生不生成")
             return
+        self._projection_save_cancel_count = 0
         fn = ensure_litematic_extension(fn)
 
         use_magma = self.chk_magma.isChecked()
         use_wither = self.chk_wither.isChecked()
-        use_rod = getattr(self, "chk_rod", None) is not None and self.chk_rod.isChecked()
+        use_rod = self.chk_rod.isChecked()
         use_portal_array = self.chk_portal_array.isChecked()
         is_axis_x = (self.portal_axis_combo.currentIndex() == 0)
         wither_base_soul = (self.wither_base_combo.currentIndex() == 1)
@@ -3858,7 +3884,9 @@ class SlimeApp(QWidget):
                     use_rod=use_rod,
                     use_portal_array=use_portal_array,
                     portal_axis_x=is_axis_x,
-                    wither_base_soul=wither_base_soul)
+                    wither_base_soul=wither_base_soul,
+                    afk_y=oy,
+                    platform_y=-64)
                 schem.save(fn)
                 self.c.msg_box.emit("information", "导出成功", f"✅ 投影已生成！\n\n【放置方法】\n进游戏站到主世界坐标 ({ox}, {oz})\n直接按加载投影")
             except Exception as e:
@@ -3885,122 +3913,157 @@ class SlimeApp(QWidget):
             else: self.upd_log("✅ 安全！周遭无深谙之域干扰史莱姆区块。")
         except ValueError: pass
 
+
     def show_history(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("历史记录")
-        dlg.setFixedSize(860, 500)
+        dlg.resize(900, 540)
         dlg.setStyleSheet(self.styleSheet())
-        v = QVBoxLayout(dlg)
+        layout = QVBoxLayout(dlg)
+
         list_widget = QListWidget()
-        history_pattern = os.path.join(APP_DIR, "history", "*.json")
-        for hf in sorted(glob.glob(history_pattern), reverse=True):
+        files = sorted(glob.glob(os.path.join(APP_DIR, "history", "*.json")), reverse=True)
+        for path in files:
             try:
-                with open(hf, 'r', encoding='utf-8') as f:
+                with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    algorithm = data.get("algorithm", "旧版记录")
-                    radius = data.get("search_params", {}).get("radius")
-                    radius_text = f"，半径: {radius}" if radius is not None else ""
-                    item = QListWidgetItem(
-                        f"{data['timestamp']} - 种子: {data['seed']}，规模: {data['size']}{radius_text} | {algorithm}")
-                    projection = data.get("projection", {})
-                    if projection:
-                        item.setToolTip("投影 {}×{}，材质 {}，算法 {}".format(
-                            projection.get("width_x", "?"), projection.get("length_z", "?"),
-                            projection.get("floor_material_id", "?"), algorithm))
-                    else:
-                        item.setToolTip("旧版历史：没有保存完整投影参数，加载时将保留当前投影设置。")
-                    item.setData(Qt.ItemDataRole.UserRole, hf)
-                    list_widget.addItem(item)
-            except Exception: pass
-        v.addWidget(list_widget)
-        btn_h = QHBoxLayout()
-        load_btn, delete_btn, close_btn = QPushButton("加载"), QPushButton("删除"), QPushButton("关闭")
-        def load_history():
+                params = data.get("search_params", {})
+                radius = params.get("radius")
+                obs = data.get("obs_count")
+                details = [f"种子 {data.get('seed')}", f"规模 {data.get('size')}"]
+                if obs is not None:
+                    details.append(f"刷怪格数 {obs}")
+                if radius is not None:
+                    details.append(f"半径 {radius}")
+                item = QListWidgetItem(f"{data.get('timestamp', '')}  ·  " + "  ·  ".join(details))
+                item.setData(Qt.ItemDataRole.UserRole, path)
+                item.setToolTip(data.get("algorithm", ""))
+                list_widget.addItem(item)
+            except Exception:
+                continue
+        if list_widget.count() == 0:
+            self._empty_history_open_count += 1
+            empty_text = "真的没有。" if self._empty_history_open_count == 5 else "暂无历史记录"
+            if self._empty_history_open_count >= 6:
+                self._empty_history_open_count = 0
+                empty_text = "暂无历史记录"
+            empty = QListWidgetItem(empty_text)
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
+            list_widget.addItem(empty)
+        else:
+            self._empty_history_open_count = 0
+        layout.addWidget(list_widget, 1)
+
+        actions = QHBoxLayout()
+        load_btn = QPushButton("加载")
+        delete_btn = QPushButton("删除")
+        close_btn = QPushButton("关闭")
+        load_btn.setObjectName("Primary")
+        actions.addWidget(delete_btn)
+        actions.addStretch()
+        actions.addWidget(close_btn)
+        actions.addWidget(load_btn)
+        layout.addLayout(actions)
+
+        def selected_path():
             item = list_widget.currentItem()
-            if item:
-                try:
-                    with open(item.data(Qt.ItemDataRole.UserRole), 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        self.main_pos, self.nether_pos = (data['x'], data['z']), (data['nether_x'], data['nether_z'])
-                        self.current_seed, self.current_size = data['seed'], data.get('size', 0)
-                        self.current_afk_y = data.get('y')
-                        self.current_obs_count = data.get('obs_count', '未知')
-                        self.current_algorithm = data.get("algorithm", "旧版记录")
+            return item.data(Qt.ItemDataRole.UserRole) if item else None
 
-                        search_params = data.get("search_params", {})
-                        seeds_from_history = search_params.get("seeds")
-                        if isinstance(seeds_from_history, list) and seeds_from_history:
-                            self.seed_text_edit.setPlainText(",".join(str(v) for v in seeds_from_history))
-                        else:
-                            self.seed_text_edit.setPlainText(str(self.current_seed))
-                        if search_params.get("radius") is not None:
-                            self.radius_input.setText(str(search_params["radius"]))
-                        if search_params.get("center_x") is not None:
-                            self.search_center_x_input.setText(str(search_params["center_x"]))
-                        if search_params.get("center_z") is not None:
-                            self.search_center_z_input.setText(str(search_params["center_z"]))
-                        if search_params.get("min_radius") is not None:
-                            self.r_inner.setText(str(search_params["min_radius"]))
-                            self.config.use_min_radius = int(search_params["min_radius"]) > 0
-                            self.rad_min_label.setVisible(self.config.use_min_radius)
-                            self.r_inner.setVisible(self.config.use_min_radius)
-                        if search_params.get("min_size") is not None:
-                            self.m_min.setText(str(search_params["min_size"]))
-                        self.config.use_range = bool(search_params.get("use_range", False))
-                        self.max_label.setVisible(self.config.use_range)
-                        self.m_max.setVisible(self.config.use_range)
-                        if search_params.get("max_size") is not None:
-                            self.m_max.setText(str(search_params["max_size"]))
-                        if "precise_afk" in search_params:
-                            self.chk_precise_afk.setChecked(bool(search_params["precise_afk"]))
-                        if "scan_y" in search_params:
-                            self.chk_scan_y.setChecked(bool(search_params["scan_y"]))
-                        if search_params.get("result_limit") is not None:
-                            self.config.result_limit = clamp_int(search_params.get("result_limit"), DEFAULT_RESULT_LIMIT, 1, MAX_RESULT_LIMIT)
-                        saved_engine = search_params.get("engine")
-                        if saved_engine:
-                            engine_idx = self.engine_combo.findText(str(saved_engine))
-                            if engine_idx >= 0:
-                                self.engine_combo.setCurrentIndex(engine_idx)
-
-                        self.top_50_results = data.get("ranked_results", [])
-                        self._refresh_rank_controls()
-                        self.apply_projection_settings(data.get("projection", {}))
-                        image_path = data.get('image', '')
-                        if image_path and not os.path.isabs(image_path):
-                            image_path = os.path.join(APP_DIR, image_path)
-                        if image_path and os.path.exists(image_path):
-                            self.sw(image_path)
-                        self.proj_manual_seed.setText(str(self.current_seed))
-                        self.proj_manual_x.setText(str(data['x']))
-                        self.proj_manual_z.setText(str(data['z']))
-                        self.trigger_floor_preview_update()
-                        self.upd_log("已加载历史：{}；搜索参数与投影生成参数已同步。".format(self.current_algorithm))
-                        dlg.accept()
-                except Exception as e:
-                    QMessageBox.warning(dlg, "加载失败", str(e))
-
-        def delete_history():
-            item = list_widget.currentItem()
-            if not item:
+        def load_selected():
+            path = selected_path()
+            if not path:
                 return
-            path = item.data(Qt.ItemDataRole.UserRole)
-            if QMessageBox.question(dlg, "删除确认", "确认删除这条历史记录？") == QMessageBox.StandardButton.Yes:
-                try:
-                    os.remove(path)
-                    list_widget.takeItem(list_widget.row(item))
-                except Exception as e:
-                    QMessageBox.warning(dlg, "删除失败", str(e))
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.main_pos = (int(data["x"]), int(data["z"]))
+                self.nether_pos = (int(data.get("nether_x", self.main_pos[0] // 8)), int(data.get("nether_z", self.main_pos[1] // 8)))
+                self.current_seed = normalize_java_seed(data["seed"])
+                self.current_size = int(data.get("size", 0))
+                self.current_obs_count = data.get("obs_count")
+                self.current_afk_y = data.get("y")
+                self.current_algorithm = data.get("algorithm", "历史记录")
 
-        load_btn.clicked.connect(load_history)
-        delete_btn.clicked.connect(delete_history)
+                params = data.get("search_params", {})
+                history_mc_version = params.get("minecraft_version")
+                if history_mc_version == "1.21 WD":
+                    history_mc_version = "1.21.4"
+                if history_mc_version in SUPPORTED_MC_VERSIONS:
+                    self.config.minecraft_version = history_mc_version
+                    set_cubiomes_mc_version(history_mc_version)
+                seeds = params.get("seeds")
+                self.seed_text_edit.setPlainText(",".join(str(v) for v in seeds) if seeds else str(self.current_seed))
+                if params.get("radius") is not None:
+                    self.radius_input.setText(str(params["radius"]))
+                if params.get("center_x") is not None:
+                    self.search_center_x_input.setText(str(params["center_x"]))
+                if params.get("center_z") is not None:
+                    self.search_center_z_input.setText(str(params["center_z"]))
+                if params.get("min_radius") is not None:
+                    self.config.use_min_radius = int(params["min_radius"]) > 0
+                    self.r_inner.setText(str(params["min_radius"]))
+                    self.rad_min_label.setVisible(self.config.use_min_radius)
+                    self.r_inner.setVisible(self.config.use_min_radius)
+                if params.get("min_size") is not None:
+                    self.m_min.setText(str(params["min_size"]))
+                self.config.use_range = bool(params.get("use_range", False))
+                self.max_label.setVisible(self.config.use_range)
+                self.m_max.setVisible(self.config.use_range)
+                if params.get("max_size") is not None:
+                    self.m_max.setText(str(params["max_size"]))
+                if "precise_afk" in params:
+                    self.chk_precise_afk.setChecked(bool(params["precise_afk"]))
+                if "scan_y" in params:
+                    self.chk_scan_y.setChecked(bool(params["scan_y"]))
+                if params.get("result_limit") is not None:
+                    self.config.result_limit = clamp_int(params["result_limit"], DEFAULT_RESULT_LIMIT, 1, MAX_RESULT_LIMIT)
+                saved_engine = params.get("engine")
+                if saved_engine:
+                    idx = self.engine_combo.findText(str(saved_engine))
+                    if idx >= 0:
+                        self.engine_combo.setCurrentIndex(idx)
+
+                self.top_50_results = data.get("ranked_results", [])
+                self._refresh_rank_controls()
+                self.apply_projection_settings(data.get("projection", {}))
+                self.proj_manual_seed.setText(str(self.current_seed))
+                self.proj_manual_x.setText(str(self.main_pos[0]))
+                self.proj_manual_z.setText(str(self.main_pos[1]))
+                self.proj_manual_y.setText("" if self.current_afk_y is None else str(self.current_afk_y))
+                image_path = data.get("image", "")
+                if image_path and not os.path.isabs(image_path):
+                    image_path = os.path.join(APP_DIR, image_path)
+                if image_path and os.path.exists(image_path):
+                    self.sw(image_path)
+                self.trigger_floor_preview_update()
+                self.info.setText(
+                    f"历史记录 | 种子: {self.current_seed} | 规模: {self.current_size} | "
+                    f"主世界: {self.main_pos} | 地狱: {self.nether_pos}")
+                dlg.accept()
+            except Exception as e:
+                QMessageBox.warning(dlg, "加载失败", str(e))
+
+        def delete_selected():
+            path = selected_path()
+            item = list_widget.currentItem()
+            if not path or item is None:
+                return
+            if QMessageBox.question(dlg, "删除历史", "确认删除这条历史记录？") != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                os.remove(path)
+                list_widget.takeItem(list_widget.row(item))
+            except Exception as e:
+                QMessageBox.warning(dlg, "删除失败", str(e))
+
+        load_btn.clicked.connect(load_selected)
+        delete_btn.clicked.connect(delete_selected)
         close_btn.clicked.connect(dlg.reject)
-        btn_h.addWidget(load_btn); btn_h.addWidget(delete_btn); btn_h.addWidget(close_btn)
-        v.addLayout(btn_h)
+        list_widget.itemDoubleClicked.connect(lambda _item: load_selected())
         dlg.exec()
 
     def export_results(self):
-        if not getattr(self, 'top_50_results', None): return
+        if not self.top_50_results: return
         if filename := QFileDialog.getSaveFileName(self, "导出CSV", "", "CSV Files (*.csv)")[0]:
             try:
                 with open(filename, 'w', encoding='utf-8') as f:
@@ -4010,58 +4073,50 @@ class SlimeApp(QWidget):
             except Exception: pass
 
     def toggle_pause_search(self):
-        if not getattr(self, "_search_in_progress", False):
+        if not self._search_in_progress:
             return
 
-        paused = bool(getattr(self, "_search_paused", False))
-        engine = getattr(self, "active_engine", "")
+        now = time.monotonic()
+        self._pause_click_times = [t for t in self._pause_click_times if now - t <= 5.0]
+        self._pause_click_times.append(now)
+        if len(self._pause_click_times) >= 6:
+            self._pause_click_times.clear()
+            self.upd_log("你是在测试暂停按钮吗？")
+
+        paused = self._search_paused
+        engine = self.active_engine
         if is_gpu_engine(engine):
-            targets = [sc_gpu_lib]
+            native_lib = sc_gpu_lib
         elif engine == "CPU (AVX2/OpenMP)":
-            targets = [sc_cpu_lib]
+            native_lib = sc_cpu_lib
         else:
-            targets = []
+            native_lib = None
 
         if not paused:
             self._search_paused = True
             self._pause_started_at = time.time()
             self.c.pause = True
-            for lib in targets:
-                if lib and hasattr(lib, "request_pause"):
-                    try:
-                        lib.request_pause()
-                    except Exception as e:
-                        self.upd_log(f"暂停原生任务失败: {e}")
+            if native_lib:
+                try:
+                    native_lib.request_pause()
+                except Exception as e:
+                    self.upd_log(f"暂停原生任务失败: {e}")
             self.cancel_btn.setText("继续")
             self.time_label.setText("已暂停 · 点击“继续”恢复")
             self.upd_log("搜索已暂停，当前进度与候选结果已保留。")
         else:
-            pause_started = float(getattr(self, "_pause_started_at", time.time()))
-            self._native_pause_accum = float(getattr(self, "_native_pause_accum", 0.0)) + max(0.0, time.time() - pause_started)
+            self._native_pause_accum += max(0.0, time.time() - self._pause_started_at)
             self._search_paused = False
             self.c.pause = False
-            for lib in targets:
-                if lib and hasattr(lib, "resume_search"):
-                    try:
-                        lib.resume_search()
-                    except Exception as e:
-                        self.upd_log(f"继续原生任务失败: {e}")
+            if native_lib:
+                try:
+                    native_lib.resume_search()
+                except Exception as e:
+                    self.upd_log(f"继续原生任务失败: {e}")
             self.cancel_btn.setText("暂停")
             self.time_label.setText("正在继续搜索...")
             self.upd_log("搜索已继续。")
 
-    def cancel_search(self):
-        """Internal hard cancel used for shutdown/compatibility, not the UI pause button."""
-        self._search_cancelled = True
-        self._search_paused = False
-        self.c.cancel = True
-        self.c.pause = False
-        for lib in (sc_cpu_lib, sc_gpu_lib):
-            if lib and hasattr(lib, "request_cancel"):
-                try:
-                    lib.request_cancel()
-                except Exception:
-                    pass
 
     def update_time(self, t): self.time_label.setText(t if t else "准备就绪")
 
@@ -4075,7 +4130,7 @@ class SlimeApp(QWidget):
             self._search_in_progress = False
             self.native_progress_timer.stop()
             self._set_progress_busy(False)
-            if getattr(self, "_search_cancelled", False):
+            if self._search_cancelled:
                 self.progress.setValue(0)
             elif self.progress.value() >= 96:
                 self.progress.setValue(100)
@@ -4101,7 +4156,7 @@ class SlimeApp(QWidget):
             self.config.search_center_z = int(self.search_center_z_input.text())
             if self.config.use_range: self.config.max_size = int(self.m_max.text())
             if self.config.use_min_radius: self.config.min_search_radius = int(self.r_inner.text())
-        except BaseException: pass
+        except ValueError: pass
         self.config.save()
         if QMessageBox.question(self, '确认', '确认退出？', QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
             self.cleanup_runtime()
@@ -4113,6 +4168,10 @@ class SlimeApp(QWidget):
         p = self.main_pos if mode == "main" else self.nether_pos
         y = self.current_afk_y if mode == "main" and self.current_afk_y is not None else "~"
         QApplication.clipboard().setText(f"/tp @s {p[0]} {y} {p[1]}")
+        self._copy_easter_count += 1
+        if self._copy_easter_count >= 10:
+            self._copy_easter_count = 0
+            self.upd_log("复制一次其实就够了")
 
     def _confirm_low_scale_large_search(self, min_size, radius):
         """One-time three-step warning for very broad low-threshold searches."""
@@ -4197,15 +4256,25 @@ class SlimeApp(QWidget):
             center_cz = center_block_z >> 4
             if rd_max <= 0:
                 raise ValueError("最大搜索半径必须大于 0。")
+            if self._reject_world_border_radius(rd_max):
+                return
+            if rd_max > MAX_SEARCH_RADIUS:
+                raise ValueError(f"最大搜索半径不能超过 {MAX_SEARCH_RADIUS:,} 个区块。")
             if rd_min < 0:
                 raise ValueError("最小搜索半径不能小于 0。")
+            if rd_min > rd_max:
+                raise ValueError("最小搜索半径不能大于最大搜索半径。")
             if (center_cx - rd_max - 8 < -2147483648 or center_cx + rd_max + 8 > 2147483647 or
                 center_cz - rd_max - 8 < -2147483648 or center_cz + rd_max + 8 > 2147483647):
                 raise ValueError("搜索中心与半径组合超出当前算法支持的区块坐标范围。")
             if ms <= 0:
                 raise ValueError("最小规模必须大于 0。")
+            if ms > 221:
+                raise ValueError("最小规模不能超过 221。")
             if self.config.use_range and max_s < ms:
                 raise ValueError("最大规模不能小于最小规模。")
+            if self.config.use_range and max_s > 221:
+                raise ValueError("最大规模不能超过 221。")
             if not self._confirm_low_scale_large_search(ms, rd_max):
                 return
             self.config.min_size = ms
@@ -4231,7 +4300,7 @@ class SlimeApp(QWidget):
                 gpu_short_name = GPU_DEVICE_NAME.replace("NVIDIA GeForce ", "").replace("NVIDIA ", "").strip()
                 self.gpu_perf_label.setVisible(is_gpu_engine(engine))
                 if is_gpu_engine(engine):
-                    self.gpu_perf_label.setText(f"{gpu_short_name} · -- B/s")
+                    self._set_gpu_perf_text(f"{gpu_short_name} · -- B/s")
             self._search_cancelled = False
             self._search_paused = False
             self._pause_started_at = 0.0

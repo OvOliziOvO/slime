@@ -46,6 +46,15 @@ inline int32_t interval_len(int32_t a, int32_t b) {
     return b >= a ? (b - a + 1) : 0;
 }
 
+inline int64_t floor_div16(int64_t v) {
+    const int64_t q = v / 16;
+    return q - ((v < 0 && v % 16 != 0) ? 1 : 0);
+}
+
+inline bool java_next_int_10_reject(uint32_t bits, uint32_t value) {
+    return bits - value + 9U > 0x7FFFFFFFU;
+}
+
 inline int32_t ctz32(uint32_t v) {
 #if defined(_MSC_VER)
     unsigned long idx = 0;
@@ -61,11 +70,11 @@ inline bool slime_from_first_lcg(uint64_t rnd) {
     if (bits < 2147483640U) {
         return ((bits & 1) == 0) && (bits * 3435973837U <= 858993459U);
     }
-    int32_t b = (int32_t)bits, v = b % 10;
-    while (b - v + 9 < 0) {
+    uint32_t b = bits, v = b % 10U;
+    while (java_next_int_10_reject(b, v)) {
         rnd = (rnd * 0x5DEECE66DULL + 0xBULL) & 0xFFFFFFFFFFFFULL;
-        b = (int32_t)(rnd >> 17);
-        v = b % 10;
+        b = (uint32_t)(rnd >> 17);
+        v = b % 10U;
     }
     return v == 0;
 }
@@ -212,19 +221,19 @@ inline bool checkSlime(int64_t seed, int64_t x, int64_t z) {
     if (bits < 2147483640U) {
         return ((bits & 1) == 0) && (bits * 3435973837U <= 858993459U);
     } else {
-        int32_t b = bits, v = b % 10;
-        while (b - v + 9 < 0) {
+        uint32_t b = bits, v = b % 10U;
+        while (java_next_int_10_reject(b, v)) {
             rnd = (rnd * 0x5DEECE66DULL + 0xBULL) & 0xFFFFFFFFFFFFULL;
-            b = (int32_t)(rnd >> 17);
-            v = b % 10;
+            b = (uint32_t)(rnd >> 17);
+            v = b % 10U;
         }
         return (v == 0);
     }
 }
 
 void build_chunk_cache(int64_t seed, int64_t ox, int64_t oz, uint32_t chunk_cache[21], int64_t& base_cx, int64_t& base_cz) {
-    base_cx = (ox >> 4) - 10;
-    base_cz = (oz >> 4) - 10;
+    base_cx = floor_div16(ox) - 10;
+    base_cz = floor_div16(oz) - 10;
     for (int32_t i = 0; i < 21; ++i) chunk_cache[i] = 0;
 
     for (int32_t i = 0; i < 21; ++i) {
@@ -245,7 +254,7 @@ int32_t count_spawnable_cached(const uint32_t chunk_cache[21], int64_t base_cx, 
     for (int32_t i = 0; i < 21; ++i) {
         uint32_t row = chunk_cache[i];
         if (!row) continue;
-        int64_t chunk_x0 = (base_cx + i) << 4;
+        int64_t chunk_x0 = (base_cx + i) * 16;
         int32_t rel_x0 = (int32_t)std::max<int64_t>(-128, chunk_x0 - ox);
         int32_t rel_x1 = (int32_t)std::min<int64_t>(128, chunk_x0 + 15 - ox);
         if (rel_x0 > rel_x1) continue;
@@ -253,7 +262,7 @@ int32_t count_spawnable_cached(const uint32_t chunk_cache[21], int64_t base_cx, 
         while (row) {
             int32_t j = ctz32(row);
             row &= row - 1;
-            int64_t chunk_z0 = (base_cz + j) << 4;
+            int64_t chunk_z0 = (base_cz + j) * 16;
             int32_t rel_z0 = (int32_t)std::max<int64_t>(-128, chunk_z0 - oz);
             int32_t rel_z1 = (int32_t)std::min<int64_t>(128, chunk_z0 + 15 - oz);
             if (rel_z0 > rel_z1) continue;
@@ -288,7 +297,7 @@ int32_t count_spawnable_cached_table(
     for (int32_t i = 0; i < 21; ++i) {
         uint32_t row = chunk_cache[i];
         if (!row) continue;
-        int64_t chunk_x0 = (base_cx + i) << 4;
+        int64_t chunk_x0 = (base_cx + i) * 16;
         int32_t rel_x0 = (int32_t)std::max<int64_t>(DX_TABLE_MIN, chunk_x0 - ox);
         int32_t rel_x1 = (int32_t)std::min<int64_t>(DX_TABLE_MAX, chunk_x0 + 15 - ox);
         if (rel_x0 > rel_x1) continue;
@@ -296,7 +305,7 @@ int32_t count_spawnable_cached_table(
         while (row) {
             int32_t j = ctz32(row);
             row &= row - 1;
-            int64_t chunk_z0 = (base_cz + j) << 4;
+            int64_t chunk_z0 = (base_cz + j) * 16;
             int32_t rel_z0 = (int32_t)std::max<int64_t>(DX_TABLE_MIN, chunk_z0 - oz);
             int32_t rel_z1 = (int32_t)std::min<int64_t>(DX_TABLE_MAX, chunk_z0 + 15 - oz);
             if (rel_z0 > rel_z1) continue;
@@ -366,7 +375,13 @@ extern "C" {
         int32_t search_center_x, int32_t search_center_z,
         ExtChunkResult* results_buffer, int32_t max_results, int32_t threads, int32_t precise_afk
     ) {
-        if (!results_buffer || max_results <= 0 || rd_max < 0) return 0;
+        if (!results_buffer || max_results <= 0 || rd_max < 0 ||
+            rd_max > (INT32_MAX - 17LL) / 2LL || rd_min < 0 || rd_min > rd_max ||
+            min_size < 0 || min_size > 221 || max_size < min_size) return -1;
+        if ((int64_t)search_center_x - rd_max - 8LL < INT32_MIN ||
+            (int64_t)search_center_x + rd_max + 8LL > INT32_MAX ||
+            (int64_t)search_center_z - rd_max - 8LL < INT32_MIN ||
+            (int64_t)search_center_z + rd_max + 8LL > INT32_MAX) return -1;
         if (threads <= 0) threads = 1;
         rebuild_y_radius_tables();
         g_progress.store(1, std::memory_order_relaxed);

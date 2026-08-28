@@ -12,9 +12,9 @@
 #include <chrono>
 #include <atomic>
 
-static int g_cancel_requested = 0;
-static int g_pause_requested = 0;
-static int g_progress = 0;
+static std::atomic<int> g_cancel_requested{0};
+static std::atomic<int> g_pause_requested{0};
+static std::atomic<int> g_progress{0};
 static std::atomic<int64_t> g_processed_centers{0};
 static std::atomic<int64_t> g_gpu_scan_work_ns{0};
 static int g_y_scan_enabled = 0;
@@ -28,10 +28,10 @@ static int16_t* g_d_outer_radius_table = nullptr;
 static int16_t* g_d_inner_radius_table = nullptr;
 static int g_gpu_y_tables_ready = 0;
 // 1=128x8, 2=256x4, 3=256x8, 4=512x4.
-static int32_t g_v34_last_shape = 0;
+static int32_t g_v1_last_shape = 0;
 // 0=native 48-bit LCG, 1=32-bit limbs, 2=truncated first-output LCG.
-static int32_t g_v34_last_rng = 0;
-static int32_t g_v34_rng_override = -1;
+static int32_t g_v1_last_rng = 0;
+static int32_t g_v1_rng_override = -1;
 
 constexpr int32_t DX_TABLE_MIN = -128;
 constexpr int32_t DX_TABLE_MAX = 128;
@@ -40,6 +40,15 @@ constexpr int32_t REFINE_BLOCK_THREADS = 128;
 
 __host__ __device__ __forceinline__ int32_t pack_obs_y(int32_t obs, int32_t y) {
     return obs | ((y + 1024) << 20);
+}
+
+__host__ __device__ __forceinline__ int64_t floor_div16(int64_t v) {
+    const int64_t q = v / 16;
+    return q - ((v < 0 && v % 16 != 0) ? 1 : 0);
+}
+
+__host__ __device__ __forceinline__ bool java_next_int_10_reject(uint32_t bits, uint32_t value) {
+    return bits - value + 9U > 0x7FFFFFFFU;
 }
 
 static int32_t isqrt_floor_host(int32_t v) {
@@ -168,17 +177,17 @@ __device__ __forceinline__ bool is_slime_fast_math(int64_t seed, uint64_t x_part
     if (__builtin_expect(bits < 2147483640U, 1)) {
         return ((bits & 1) == 0) && (bits * 3435973837U <= 858993459U);
     } else {
-        int32_t b = bits, v = b % 10;
-        while (b - v + 9 < 0) {
+        uint32_t b = bits, v = b % 10U;
+        while (java_next_int_10_reject(b, v)) {
             rnd = (rnd * 0x5DEECE66DULL + 0xBULL) & 0xFFFFFFFFFFFFULL;
-            b = (int32_t)(rnd >> 17);
-            v = b % 10;
+            b = (uint32_t)(rnd >> 17);
+            v = b % 10U;
         }
         return (v == 0);
     }
 }
 
-// V34 hot path. The host folds the world seed into every Z term once, so
+// V1 hot path. The host folds the world seed into every Z term once, so
 // each chunk needs only one 64-bit addition here.  The mask before the first
 // LCG multiply is intentionally omitted: the low 48 bits of a product depend
 // only on the low 48 bits of its inputs.  The post-multiply mask still creates
@@ -199,12 +208,12 @@ __device__ __forceinline__ bool is_slime_fast_math_seeded_z(
         return q <= 0x19999999U;
     }
 
-    int32_t b = (int32_t)bits;
-    int32_t v = b % 10;
-    while (b - v + 9 < 0) {
+    uint32_t b = bits;
+    uint32_t v = b % 10U;
+    while (java_next_int_10_reject(b, v)) {
         rnd = (rnd * 0x5DEECE66DULL + 0xBULL) & 0xFFFFFFFFFFFFULL;
-        b = (int32_t)(rnd >> 17);
-        v = b % 10;
+        b = (uint32_t)(rnd >> 17);
+        v = b % 10U;
     }
     return v == 0;
 }
@@ -239,13 +248,13 @@ __device__ __forceinline__ bool is_slime_fast_math_seeded_z_limb32(
         return q <= 0x19999999U;
     }
 
-    int32_t b = (int32_t)bits;
-    int32_t v = b % 10;
-    while (b - v + 9 < 0) {
+    uint32_t b = bits;
+    uint32_t v = b % 10U;
+    while (java_next_int_10_reject(b, v)) {
         lcg48_step_limb32(lo, hi);
         bits = (hi << 15) | (lo >> 17);
-        b = (int32_t)bits;
-        v = b % 10;
+        b = bits;
+        v = b % 10U;
     }
     return v == 0;
 }
@@ -281,12 +290,12 @@ __device__ __forceinline__ bool is_slime_fast_math_seeded_z_truncated(
     // Cold path: recover the complete Java state before advancing again.
     uint64_t rnd = (initial * 0x5DEECE66DULL + 0xBULL) &
                    0xFFFFFFFFFFFFULL;
-    int32_t b = (int32_t)bits;
-    int32_t v = b % 10;
-    while (b - v + 9 < 0) {
+    uint32_t b = bits;
+    uint32_t v = b % 10U;
+    while (java_next_int_10_reject(b, v)) {
         rnd = (rnd * 0x5DEECE66DULL + 0xBULL) & 0xFFFFFFFFFFFFULL;
-        b = (int32_t)(rnd >> 17);
-        v = b % 10;
+        b = (uint32_t)(rnd >> 17);
+        v = b % 10U;
     }
     return v == 0;
 }
@@ -314,32 +323,32 @@ __device__ __forceinline__ int32_t circle_from_shared_ring(
     // all 221 included cells. Largest corner slices run first, allowing most
     // false square survivors to stop after only a few popcounts.
     int32_t exact = square_score;
-    #define V34_OUT_OF_RANGE(REM) (exact < min_size || (!NO_UPPER && exact - (REM) > max_size))
-    #define V34_SUB_CORNERS(I, MDX) do { \
+    #define V1_OUT_OF_RANGE(REM) (exact < min_size || (!NO_UPPER && exact - (REM) > max_size))
+    #define V1_SUB_CORNERS(I, MDX) do { \
         const uint32_t* src = rows + (((current_row - 16 + (I)) & 31) * STRIDE); \
         const uint32_t bits17 = __funnelshift_r(src[word], src[word + 1], lane) & 0x1FFFFU; \
         constexpr uint32_t inside = ((1U << (2 * (MDX) + 1)) - 1U) << (8 - (MDX)); \
         constexpr uint32_t corners = 0x1FFFFU ^ inside; \
         exact -= __popc(bits17 & corners); \
     } while (0)
-    V34_SUB_CORNERS( 0, 2); V34_SUB_CORNERS(16, 2); // 24 cells
-    if (V34_OUT_OF_RANGE(44)) return exact;
-    V34_SUB_CORNERS( 1, 4); V34_SUB_CORNERS(15, 4); // 16 cells
-    if (V34_OUT_OF_RANGE(28)) return exact;
-    V34_SUB_CORNERS( 2, 5); V34_SUB_CORNERS(14, 5); // 12 cells
-    if (V34_OUT_OF_RANGE(16)) return exact;
-    V34_SUB_CORNERS( 3, 6); V34_SUB_CORNERS(13, 6); // 8 cells
-    if (V34_OUT_OF_RANGE(8)) return exact;
-    V34_SUB_CORNERS( 4, 7); V34_SUB_CORNERS( 5, 7);
-    V34_SUB_CORNERS(11, 7); V34_SUB_CORNERS(12, 7); // 8 cells
-    #undef V34_SUB_CORNERS
-    #undef V34_OUT_OF_RANGE
+    V1_SUB_CORNERS( 0, 2); V1_SUB_CORNERS(16, 2); // 24 cells
+    if (V1_OUT_OF_RANGE(44)) return exact;
+    V1_SUB_CORNERS( 1, 4); V1_SUB_CORNERS(15, 4); // 16 cells
+    if (V1_OUT_OF_RANGE(28)) return exact;
+    V1_SUB_CORNERS( 2, 5); V1_SUB_CORNERS(14, 5); // 12 cells
+    if (V1_OUT_OF_RANGE(16)) return exact;
+    V1_SUB_CORNERS( 3, 6); V1_SUB_CORNERS(13, 6); // 8 cells
+    if (V1_OUT_OF_RANGE(8)) return exact;
+    V1_SUB_CORNERS( 4, 7); V1_SUB_CORNERS( 5, 7);
+    V1_SUB_CORNERS(11, 7); V1_SUB_CORNERS(12, 7); // 8 cells
+    #undef V1_SUB_CORNERS
+    #undef V1_OUT_OF_RANGE
     return exact;
 }
 
 template <int TPB, int CPT, bool DENSE_COUNT, int RNG_MODE,
           bool HAS_OLD, bool EMIT, bool FULL_X, bool NO_UPPER>
-__device__ __forceinline__ void fused_sparse_v34_row(
+__device__ __forceinline__ void fused_sparse_v1_row(
     uint32_t* rows,
     const uint64_t* __restrict__ seeded_z_terms,
     int32_t z_base, int32_t r, int32_t lane, int32_t warp,
@@ -349,7 +358,7 @@ __device__ __forceinline__ void fused_sparse_v34_row(
     int32_t search_center_x, int32_t search_center_z,
     int32_t base_x, int32_t slab_base_z, int32_t x_base,
     ExtChunkResult* d_results, int32_t max_gpu_buffer,
-    uint32_t& thread_found_count, uint32_t* d_emitted_count
+    uint32_t& thread_found_count, unsigned long long* d_emitted_count
 ) {
     constexpr int WARPS = TPB / 32;
     constexpr int WORDS = WARPS * CPT;
@@ -393,8 +402,8 @@ __device__ __forceinline__ void fused_sparse_v34_row(
                 rows, r, word, lane, square, min_size, max_size);
             if (exact >= min_size && (NO_UPPER || exact <= max_size)) {
                 if constexpr (!DENSE_COUNT) {
-                    const uint32_t out = atomicAdd(d_emitted_count, 1U);
-                    if (out < (uint32_t)max_gpu_buffer) {
+                    const unsigned long long out = atomicAdd(d_emitted_count, 1ULL);
+                    if (out < (unsigned long long)max_gpu_buffer) {
                         d_results[out].size = exact;
                         d_results[out].center_x = cx * 16 + 8;
                         d_results[out].center_z = cz * 16 + 8;
@@ -402,8 +411,8 @@ __device__ __forceinline__ void fused_sparse_v34_row(
                 } else {
                     ++thread_found_count;
                     if (exact >= emit_min_size) {
-                        const uint32_t out = atomicAdd(d_emitted_count, 1U);
-                        if (out < (uint32_t)max_gpu_buffer) {
+                        const unsigned long long out = atomicAdd(d_emitted_count, 1ULL);
+                        if (out < (unsigned long long)max_gpu_buffer) {
                             d_results[out].size = exact;
                             d_results[out].center_x = cx * 16 + 8;
                             d_results[out].center_z = cz * 16 + 8;
@@ -416,7 +425,7 @@ __device__ __forceinline__ void fused_sparse_v34_row(
 }
 
 template <int TPB, int CPT, int BAND_H, bool DENSE_COUNT, int RNG_MODE, bool NO_UPPER>
-__global__ __launch_bounds__(TPB) void search_slime_fused_sparse_v34_kernel(
+__global__ __launch_bounds__(TPB) void search_slime_fused_sparse_v1_kernel(
     const uint64_t* __restrict__ x_terms,
     const uint64_t* __restrict__ seeded_z_terms,
     int32_t search_center_x, int32_t search_center_z,
@@ -425,7 +434,7 @@ __global__ __launch_bounds__(TPB) void search_slime_fused_sparse_v34_kernel(
     int32_t tiles_x, int32_t tiles_z,
     int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
     ExtChunkResult* d_results, int32_t max_gpu_buffer,
-    uint32_t* d_found_count, uint32_t* d_emitted_count
+    unsigned long long* d_found_count, unsigned long long* d_emitted_count
 ) {
     constexpr int TILE_W = TPB * CPT;
     constexpr int OUT_W = TILE_W - 16;
@@ -471,20 +480,20 @@ __global__ __launch_bounds__(TPB) void search_slime_fused_sparse_v34_kernel(
         // and each row synchronizes immediately after publishing its ballots.
         if (tile_out_w == OUT_W) {
             for (int32_t r = 0; r < 16; ++r)
-                fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,true,NO_UPPER>(
+                fused_sparse_v1_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,true,NO_UPPER>(
                     rows, seeded_z_terms, z_base, r, lane, warp,
                     xt, input_active, output_active, square_score,
                     min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
                     base_x, slab_base_z, x_base,
                     d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
-            fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,true,NO_UPPER>(
+            fused_sparse_v1_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,true,NO_UPPER>(
                 rows, seeded_z_terms, z_base, 16, lane, warp,
                 xt, input_active, output_active, square_score,
                 min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
                 base_x, slab_base_z, x_base,
                 d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
             for (int32_t r = 17; r < tile_in_h; ++r)
-                fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,true,NO_UPPER>(
+                fused_sparse_v1_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,true,NO_UPPER>(
                     rows, seeded_z_terms, z_base, r, lane, warp,
                     xt, input_active, output_active, square_score,
                     min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
@@ -492,20 +501,20 @@ __global__ __launch_bounds__(TPB) void search_slime_fused_sparse_v34_kernel(
                     d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
         } else {
             for (int32_t r = 0; r < 16; ++r)
-                fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,false,NO_UPPER>(
+                fused_sparse_v1_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,false,NO_UPPER>(
                     rows, seeded_z_terms, z_base, r, lane, warp,
                     xt, input_active, output_active, square_score,
                     min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
                     base_x, slab_base_z, x_base,
                     d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
-            fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,false,NO_UPPER>(
+            fused_sparse_v1_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,false,NO_UPPER>(
                 rows, seeded_z_terms, z_base, 16, lane, warp,
                 xt, input_active, output_active, square_score,
                 min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
                 base_x, slab_base_z, x_base,
                 d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
             for (int32_t r = 17; r < tile_in_h; ++r)
-                fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,false,NO_UPPER>(
+                fused_sparse_v1_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,false,NO_UPPER>(
                     rows, seeded_z_terms, z_base, r, lane, warp,
                     xt, input_active, output_active, square_score,
                     min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
@@ -522,7 +531,7 @@ __global__ __launch_bounds__(TPB) void search_slime_fused_sparse_v34_kernel(
         if (lane == 0) atomicAdd(&block_found_count, thread_found_count);
         __syncthreads();
         if (tx == 0 && block_found_count != 0U)
-            atomicAdd(d_found_count, block_found_count);
+            atomicAdd(d_found_count, (unsigned long long)block_found_count);
     }
 }
 
@@ -534,8 +543,8 @@ __device__ bool checkSlimeDevice(int64_t seed, int64_t global_x, int64_t global_
 }
 
 __device__ void build_chunk_cache_device(int64_t seed, int64_t ox, int64_t oz, uint32_t chunk_cache[21], int64_t& base_cx, int64_t& base_cz) {
-    base_cx = (ox >> 4) - 10;
-    base_cz = (oz >> 4) - 10;
+    base_cx = floor_div16(ox) - 10;
+    base_cz = floor_div16(oz) - 10;
     for (int i = 0; i < 21; ++i) {
         uint32_t row_mask = 0;
         for (int j = 0; j < 21; ++j) {
@@ -559,7 +568,7 @@ __device__ int32_t count_spawnable_cached_device(
     for (int32_t i = 0; i < 21; ++i) {
         uint32_t row = chunk_cache[i];
         if (!row) continue;
-        int64_t chunk_x0 = (base_cx + i) << 4;
+        int64_t chunk_x0 = (base_cx + i) * 16;
         int32_t rel_x0_raw = (int32_t)(chunk_x0 - ox);
         int32_t rel_x1_raw = (int32_t)(chunk_x0 + 15 - ox);
         int32_t rel_x0 = rel_x0_raw < -128 ? -128 : rel_x0_raw;
@@ -569,7 +578,7 @@ __device__ int32_t count_spawnable_cached_device(
         while (row) {
             int32_t j = __ffs(row) - 1;
             row &= row - 1;
-            int64_t chunk_z0 = (base_cz + j) << 4;
+            int64_t chunk_z0 = (base_cz + j) * 16;
             int32_t rel_z0_raw = (int32_t)(chunk_z0 - oz);
             int32_t rel_z1_raw = (int32_t)(chunk_z0 + 15 - oz);
             int32_t rel_z0 = rel_z0_raw < -128 ? -128 : rel_z0_raw;
@@ -608,7 +617,7 @@ __device__ int32_t count_spawnable_cached_table_device(
     for (int32_t i = 0; i < 21; ++i) {
         uint32_t row = chunk_cache[i];
         if (!row) continue;
-        int64_t chunk_x0 = (base_cx + i) << 4;
+        int64_t chunk_x0 = (base_cx + i) * 16;
         int32_t rel_x0_raw = (int32_t)(chunk_x0 - ox);
         int32_t rel_x1_raw = (int32_t)(chunk_x0 + 15 - ox);
         int32_t rel_x0 = rel_x0_raw < DX_TABLE_MIN ? DX_TABLE_MIN : rel_x0_raw;
@@ -618,7 +627,7 @@ __device__ int32_t count_spawnable_cached_table_device(
         while (row) {
             int32_t j = __ffs(row) - 1;
             row &= row - 1;
-            int64_t chunk_z0 = (base_cz + j) << 4;
+            int64_t chunk_z0 = (base_cz + j) * 16;
             int32_t rel_z0_raw = (int32_t)(chunk_z0 - oz);
             int32_t rel_z1_raw = (int32_t)(chunk_z0 + 15 - oz);
             int32_t rel_z0 = rel_z0_raw < DX_TABLE_MIN ? DX_TABLE_MIN : rel_z0_raw;
@@ -665,7 +674,7 @@ __device__ int32_t count_spawnable_union_table_device(
         uint32_t row = union_cache[x_offset + i] >> z_shift;
         row &= 0x1FFFFFu; // 21 chunks in the local window
         if (!row) continue;
-        int64_t chunk_x0 = (base_cx + i) << 4;
+        int64_t chunk_x0 = (base_cx + i) * 16;
         int32_t rel_x0_raw = (int32_t)(chunk_x0 - ox);
         int32_t rel_x1_raw = (int32_t)(chunk_x0 + 15 - ox);
         int32_t rel_x0 = rel_x0_raw < DX_TABLE_MIN ? DX_TABLE_MIN : rel_x0_raw;
@@ -675,7 +684,7 @@ __device__ int32_t count_spawnable_union_table_device(
         while (row) {
             int32_t j = __ffs(row) - 1;
             row &= row - 1;
-            int64_t chunk_z0 = (base_cz + j) << 4;
+            int64_t chunk_z0 = (base_cz + j) * 16;
             int32_t rel_z0_raw = (int32_t)(chunk_z0 - oz);
             int32_t rel_z1_raw = (int32_t)(chunk_z0 + 15 - oz);
             int32_t rel_z0 = rel_z0_raw < DX_TABLE_MIN ? DX_TABLE_MIN : rel_z0_raw;
@@ -772,8 +781,8 @@ __global__ void refine_afk_block_kernel(
     // Build the complete chunk window needed by all 81 refinement positions.
     // The old kernel rebuilt a 21x21 hash cache for every position.
     if (tid == 0) {
-        union_base_cx_s = (bx >> 4) - 11;
-        union_base_cz_s = (bz >> 4) - 11;
+        union_base_cx_s = floor_div16(bx) - 11;
+        union_base_cz_s = floor_div16(bz) - 11;
     }
     __syncthreads();
     if (tid < 23) {
@@ -793,8 +802,8 @@ __global__ void refine_afk_block_kernel(
         int64_t ox = bx + dx;
         int64_t oz = bz + dz;
 
-        int64_t base_cx = (ox >> 4) - 10;
-        int64_t base_cz = (oz >> 4) - 10;
+        int64_t base_cx = floor_div16(ox) - 10;
+        int64_t base_cz = floor_div16(oz) - 10;
 
         for (int32_t yi = tid; yi < safe_y_count; yi += blockDim.x) {
             const int16_t* outer = outer_radius_table + (size_t)yi * DX_TABLE_COUNT;
@@ -872,41 +881,46 @@ extern "C" {
     }
 
 
-    __declspec(dllexport) int32_t get_gpu_v34_shape() {
-        return g_v34_last_shape;
+    __declspec(dllexport) int32_t get_gpu_v1_shape() {
+        return g_v1_last_shape;
     }
 
-    __declspec(dllexport) int32_t get_gpu_v34_rng() {
-        return g_v34_last_rng;
+    __declspec(dllexport) int32_t get_gpu_v1_rng() {
+        return g_v1_last_rng;
     }
 
-    __declspec(dllexport) void set_gpu_v34_rng_override(int32_t value) {
-        g_v34_rng_override = (value >= 0 && value <= 2) ? value : -1;
+    __declspec(dllexport) void set_gpu_v1_rng_override(int32_t value) {
+        g_v1_rng_override = (value >= 0 && value <= 2) ? value : -1;
     }
+
+    // Legacy ABI aliases for older frontends.
+    __declspec(dllexport) int32_t get_gpu_v34_shape() { return get_gpu_v1_shape(); }
+    __declspec(dllexport) int32_t get_gpu_v34_rng() { return get_gpu_v1_rng(); }
+    __declspec(dllexport) void set_gpu_v34_rng_override(int32_t value) { set_gpu_v1_rng_override(value); }
 
     __declspec(dllexport) void request_cancel() {
-        g_cancel_requested = 1;
-        g_pause_requested = 0;
+        g_cancel_requested.store(1, std::memory_order_relaxed);
+        g_pause_requested.store(0, std::memory_order_relaxed);
     }
 
     __declspec(dllexport) void request_pause() {
-        g_pause_requested = 1;
+        g_pause_requested.store(1, std::memory_order_relaxed);
     }
 
     __declspec(dllexport) void resume_search() {
-        g_pause_requested = 0;
+        g_pause_requested.store(0, std::memory_order_relaxed);
     }
 
     __declspec(dllexport) void reset_cancel() {
-        g_cancel_requested = 0;
-        g_pause_requested = 0;
-        g_progress = 0;
+        g_cancel_requested.store(0, std::memory_order_relaxed);
+        g_pause_requested.store(0, std::memory_order_relaxed);
+        g_progress.store(0, std::memory_order_relaxed);
         g_processed_centers.store(0, std::memory_order_relaxed);
         g_gpu_scan_work_ns.store(0, std::memory_order_relaxed);
     }
 
     __declspec(dllexport) int32_t get_progress() {
-        return g_progress;
+        return g_progress.load(std::memory_order_relaxed);
     }
 
     __declspec(dllexport) int64_t get_processed_centers() {
@@ -943,31 +957,30 @@ extern "C" {
         uint64_t rnd = ((s ^ 0x3ad8025fLL) ^ 0x5DEECE66DULL) & 0xFFFFFFFFFFFFULL;
         rnd = (rnd * 0x5DEECE66DULL + 0xBULL) & 0xFFFFFFFFFFFFULL;
         uint32_t bits = (uint32_t)(rnd >> 17);
-        int32_t b = bits, v = b % 10;
-        while (b - v + 9 < 0) {
+        uint32_t b = bits, v = b % 10U;
+        while (java_next_int_10_reject(b, v)) {
             rnd = (rnd * 0x5DEECE66DULL + 0xBULL) & 0xFFFFFFFFFFFFULL;
-            b = (int32_t)(rnd >> 17);
-            v = b % 10;
+            b = (uint32_t)(rnd >> 17);
+            v = b % 10U;
         }
         return v == 0;
     }
 
 
-    static int64_t search_slime_clusters_gpu_v34_impl(
+    static int64_t search_slime_clusters_gpu_v1_impl(
         int64_t seed, int64_t rd_max, int32_t min_size, int32_t max_size, int64_t rd_min,
         int32_t search_center_x, int32_t search_center_z,
         ExtChunkResult* results_buffer, int32_t max_results, int32_t precise_afk
     ) {
-        // V34 is the only scan implementation. Return -1 on invalid input or a
-        // CUDA failure; the Python layer reports the failure without fallback.
         if (!results_buffer || max_results <= 0 || rd_max < 0 ||
-            rd_max > (INT32_MAX - 17LL) / 2LL || min_size < 0) return -1;
+            rd_max > (INT32_MAX - 17LL) / 2LL || rd_min < 0 || rd_min > rd_max ||
+            min_size < 0 || min_size > 221 || max_size < min_size) return -1;
         if ((int64_t)search_center_x - rd_max - 8LL < INT32_MIN ||
             (int64_t)search_center_x + rd_max + 8LL > INT32_MAX ||
             (int64_t)search_center_z - rd_max - 8LL < INT32_MIN ||
             (int64_t)search_center_z + rd_max + 8LL > INT32_MAX) return -1;
         if (!g_gpu_y_tables_ready) rebuild_gpu_y_tables();
-        g_progress = 1;
+        g_progress.store(1, std::memory_order_relaxed);
 
         const int32_t width = (int32_t)(rd_max * 2 + 1);
         const int32_t height = width;
@@ -1000,9 +1013,9 @@ extern "C" {
         uint64_t* d_x_terms = nullptr;
         uint64_t* d_z_terms = nullptr;
         ExtChunkResult* d_results = nullptr;
-        uint32_t* d_found_count = nullptr;
-        uint32_t* d_emitted_count = nullptr;
-        auto release_v34 = [&]() {
+        unsigned long long* d_found_count = nullptr;
+        unsigned long long* d_emitted_count = nullptr;
+        auto release_v1 = [&]() {
             if (d_emitted_count) cudaFree(d_emitted_count);
             if (d_found_count) cudaFree(d_found_count);
             if (d_results) cudaFree(d_results);
@@ -1014,9 +1027,9 @@ extern "C" {
             cudaMalloc(&d_z_terms, term_count * sizeof(uint64_t)) != cudaSuccess ||
             cudaMemcpy(d_x_terms, h_x_terms.data(), term_count * sizeof(uint64_t), cudaMemcpyHostToDevice) != cudaSuccess ||
             cudaMemcpy(d_z_terms, h_z_terms.data(), term_count * sizeof(uint64_t), cudaMemcpyHostToDevice) != cudaSuccess) {
-            release_v34();
+            release_v1();
             cudaGetLastError();
-            g_progress = 0;
+            g_progress.store(0, std::memory_order_relaxed);
             return -1;
         }
         // Release the large pageable host buffers before starting a long scan.
@@ -1029,22 +1042,22 @@ extern "C" {
             if (gpu_buffer_cap == min_buffer) break;
             gpu_buffer_cap = std::max(min_buffer, gpu_buffer_cap / 2);
         }
-        if (!d_results || cudaMalloc(&d_found_count, sizeof(uint32_t)) != cudaSuccess ||
-            cudaMalloc(&d_emitted_count, sizeof(uint32_t)) != cudaSuccess ||
-            cudaMemset(d_found_count, 0, sizeof(uint32_t)) != cudaSuccess ||
-            cudaMemset(d_emitted_count, 0, sizeof(uint32_t)) != cudaSuccess) {
-            release_v34();
+        if (!d_results || cudaMalloc(&d_found_count, sizeof(unsigned long long)) != cudaSuccess ||
+            cudaMalloc(&d_emitted_count, sizeof(unsigned long long)) != cudaSuccess ||
+            cudaMemset(d_found_count, 0, sizeof(unsigned long long)) != cudaSuccess ||
+            cudaMemset(d_emitted_count, 0, sizeof(unsigned long long)) != cudaSuccess) {
+            release_v1();
             cudaGetLastError();
-            g_progress = 0;
+            g_progress.store(0, std::memory_order_relaxed);
             return -1;
         }
 
         constexpr int32_t BAND_H = 2048;
-        int32_t v34_shape = 2; // portable short-search default: 256x4
-        int32_t v34_rng = 0;   // portable exact baseline
-        int32_t v34_tpb = 256;
-        int32_t v34_cpt = 4;
-        int32_t out_tile_width = v34_tpb * v34_cpt - 16;
+        int32_t v1_shape = 2; // portable short-search default: 256x4
+        int32_t v1_rng = 0;   // portable exact baseline
+        int32_t v1_tpb = 256;
+        int32_t v1_cpt = 4;
+        int32_t out_tile_width = v1_tpb * v1_cpt - 16;
         // Target roughly 100 billion centers per persistent launch.  Narrow
         // scans get tall batches that amortize synchronization/tail waves;
         // full-width scans keep a 2-3 second progress/cancellation cadence.
@@ -1055,49 +1068,49 @@ extern "C" {
         int32_t slab_height = (int32_t)std::max<int64_t>(
             MIN_SLAB_H, std::min<int64_t>(MAX_SLAB_H, desired_slab_h));
         slab_height = std::max(BAND_H, (slab_height / BAND_H) * BAND_H);
-        auto launch_v34 = [&](int32_t shape, int32_t rng_variant,
+        auto launch_v1 = [&](int32_t shape, int32_t rng_variant,
                               int32_t launch_z_offset,
                               int32_t launch_width, int32_t launch_height,
                               int32_t launch_tiles_x, int32_t launch_tiles_z,
                               int32_t launch_blocks, int32_t emit_min_size) -> cudaError_t {
-            #define LAUNCH_V34_SHAPE_IMPL(T, C, R, N) do { \
+            #define LAUNCH_V1_SHAPE_IMPL(T, C, R, N) do { \
                 if (emit_min_size > min_size) \
-                    search_slime_fused_sparse_v34_kernel<T, C, BAND_H, true, R, N><<<launch_blocks, T>>>( \
+                    search_slime_fused_sparse_v1_kernel<T, C, BAND_H, true, R, N><<<launch_blocks, T>>>( \
                         d_x_terms, d_z_terms + launch_z_offset, \
                         search_center_x, search_center_z, \
                         base_x, base_z + launch_z_offset, launch_width, launch_height, \
                         launch_tiles_x, launch_tiles_z, min_size, max_size, emit_min_size, rd_min_sq, \
                         d_results, gpu_buffer_cap, d_found_count, d_emitted_count); \
                 else \
-                    search_slime_fused_sparse_v34_kernel<T, C, BAND_H, false, R, N><<<launch_blocks, T>>>( \
+                    search_slime_fused_sparse_v1_kernel<T, C, BAND_H, false, R, N><<<launch_blocks, T>>>( \
                         d_x_terms, d_z_terms + launch_z_offset, \
                         search_center_x, search_center_z, \
                         base_x, base_z + launch_z_offset, launch_width, launch_height, \
                         launch_tiles_x, launch_tiles_z, min_size, max_size, emit_min_size, rd_min_sq, \
                         d_results, gpu_buffer_cap, d_found_count, d_emitted_count); \
             } while (0)
-            #define LAUNCH_V34_SHAPE(T, C, R) do { \
-                if (max_size >= 221) LAUNCH_V34_SHAPE_IMPL(T, C, R, true); \
-                else LAUNCH_V34_SHAPE_IMPL(T, C, R, false); \
+            #define LAUNCH_V1_SHAPE(T, C, R) do { \
+                if (max_size >= 221) LAUNCH_V1_SHAPE_IMPL(T, C, R, true); \
+                else LAUNCH_V1_SHAPE_IMPL(T, C, R, false); \
             } while (0)
             if (rng_variant == 2) {
-                if (shape == 1) LAUNCH_V34_SHAPE(128, 8, 2);
-                else if (shape == 3) LAUNCH_V34_SHAPE(256, 8, 2);
-                else if (shape == 4) LAUNCH_V34_SHAPE(512, 4, 2);
-                else LAUNCH_V34_SHAPE(256, 4, 2);
+                if (shape == 1) LAUNCH_V1_SHAPE(128, 8, 2);
+                else if (shape == 3) LAUNCH_V1_SHAPE(256, 8, 2);
+                else if (shape == 4) LAUNCH_V1_SHAPE(512, 4, 2);
+                else LAUNCH_V1_SHAPE(256, 4, 2);
             } else if (rng_variant == 1) {
-                if (shape == 1) LAUNCH_V34_SHAPE(128, 8, 1);
-                else if (shape == 3) LAUNCH_V34_SHAPE(256, 8, 1);
-                else if (shape == 4) LAUNCH_V34_SHAPE(512, 4, 1);
-                else LAUNCH_V34_SHAPE(256, 4, 1);
+                if (shape == 1) LAUNCH_V1_SHAPE(128, 8, 1);
+                else if (shape == 3) LAUNCH_V1_SHAPE(256, 8, 1);
+                else if (shape == 4) LAUNCH_V1_SHAPE(512, 4, 1);
+                else LAUNCH_V1_SHAPE(256, 4, 1);
             } else {
-                if (shape == 1) LAUNCH_V34_SHAPE(128, 8, 0);
-                else if (shape == 3) LAUNCH_V34_SHAPE(256, 8, 0);
-                else if (shape == 4) LAUNCH_V34_SHAPE(512, 4, 0);
-                else LAUNCH_V34_SHAPE(256, 4, 0);
+                if (shape == 1) LAUNCH_V1_SHAPE(128, 8, 0);
+                else if (shape == 3) LAUNCH_V1_SHAPE(256, 8, 0);
+                else if (shape == 4) LAUNCH_V1_SHAPE(512, 4, 0);
+                else LAUNCH_V1_SHAPE(256, 4, 0);
             }
-            #undef LAUNCH_V34_SHAPE
-            #undef LAUNCH_V34_SHAPE_IMPL
+            #undef LAUNCH_V1_SHAPE
+            #undef LAUNCH_V1_SHAPE_IMPL
             return cudaGetLastError();
         };
 
@@ -1105,18 +1118,19 @@ extern "C" {
         cudaDeviceProp prop{};
         bool have_prop = cudaGetDevice(&device) == cudaSuccess &&
                          cudaGetDeviceProperties(&prop, device) == cudaSuccess;
-        const char* forced = std::getenv("SLIME_GPU_V34_SHAPE");
-        if (forced && std::strcmp(forced, "128x8") == 0) v34_shape = 1;
-        else if (forced && std::strcmp(forced, "256x4") == 0) v34_shape = 2;
-        else if (forced && std::strcmp(forced, "256x8") == 0) v34_shape = 3;
+        const char* forced = std::getenv("SLIME_GPU_V1_SHAPE");
+        if (!forced) forced = std::getenv("SLIME_GPU_V34_SHAPE");
+        if (forced && std::strcmp(forced, "128x8") == 0) v1_shape = 1;
+        else if (forced && std::strcmp(forced, "256x4") == 0) v1_shape = 2;
+        else if (forced && std::strcmp(forced, "256x8") == 0) v1_shape = 3;
         else if (forced && std::strcmp(forced, "512x4") == 0 &&
-                 (!have_prop || prop.maxThreadsPerBlock >= 512)) v34_shape = 4;
+                 (!have_prop || prop.maxThreadsPerBlock >= 512)) v1_shape = 4;
         else {
-            static uint8_t tuned_v34[32][2] = {};
+            static uint8_t tuned_v1[32][2] = {};
             int32_t slot = std::max(0, std::min(31, device));
             int32_t bucket = min_size <= 45 ? 0 : 1;
-            if (tuned_v34[slot][bucket]) {
-                v34_shape = tuned_v34[slot][bucket];
+            if (tuned_v1[slot][bucket]) {
+                v1_shape = tuned_v1[slot][bucket];
             } else if ((int64_t)width * height >= 100000000000LL) {
                 // Use a saturated multi-wave sample. The older ~536M-center
                 // sample launched too few blocks and could select 512x4 even
@@ -1139,12 +1153,12 @@ extern "C" {
                     int32_t sx = (sample_width + sw - 1) / sw;
                     int32_t sz = (sample_height + BAND_H - 1) / BAND_H;
                     int32_t blocks = std::max(1, std::min(8192, sx * sz));
-                    if (!events_ok || cudaMemset(d_found_count, 0, sizeof(uint32_t)) != cudaSuccess ||
-                        cudaMemset(d_emitted_count, 0, sizeof(uint32_t)) != cudaSuccess ||
+                    if (!events_ok || cudaMemset(d_found_count, 0, sizeof(unsigned long long)) != cudaSuccess ||
+                        cudaMemset(d_emitted_count, 0, sizeof(unsigned long long)) != cudaSuccess ||
                         cudaEventRecord(start) != cudaSuccess) return false;
                     constexpr int repeats = 2;
                     for (int i = 0; i < repeats; ++i) {
-                        if (launch_v34(shape, 0, 0, sample_width, sample_height,
+                        if (launch_v1(shape, 0, 0, sample_width, sample_height,
                                        sx, sz, blocks, std::max(min_size, 45)) != cudaSuccess) return false;
                     }
                     if (cudaEventRecord(stop) != cudaSuccess ||
@@ -1172,46 +1186,47 @@ extern "C" {
                 if (start) cudaEventDestroy(start);
                 if (stop) cudaEventDestroy(stop);
                 cudaGetLastError();
-                v34_shape = best_shape;
-                tuned_v34[slot][bucket] = (uint8_t)v34_shape;
+                v1_shape = best_shape;
+                tuned_v1[slot][bucket] = (uint8_t)v1_shape;
             } else if (min_size < 42) {
                 // Keep a low-overhead dense default for small searches; large
                 // searches above use the real device measurement.
-                v34_shape = 1;
+                v1_shape = 1;
             }
         }
-        if (v34_shape == 1) { v34_tpb = 128; v34_cpt = 8; }
-        else if (v34_shape == 3) { v34_tpb = 256; v34_cpt = 8; }
-        else if (v34_shape == 4) { v34_tpb = 512; v34_cpt = 4; }
-        else { v34_tpb = 256; v34_cpt = 4; }
-        out_tile_width = v34_tpb * v34_cpt - 16;
-        g_v34_last_shape = v34_shape;
+        if (v1_shape == 1) { v1_tpb = 128; v1_cpt = 8; }
+        else if (v1_shape == 3) { v1_tpb = 256; v1_cpt = 8; }
+        else if (v1_shape == 4) { v1_tpb = 512; v1_cpt = 4; }
+        else { v1_tpb = 256; v1_cpt = 4; }
+        out_tile_width = v1_tpb * v1_cpt - 16;
+        g_v1_last_shape = v1_shape;
 
         // The exact RNG implementations can trade places across GPU
         // generations.  Benchmark them locally on a saturated sample and
         // cache independently for dense/sparse thresholds.  A 3% margin
         // keeps the compiler-native baseline when results are effectively
         // tied.  Matching exact/stored counts are a runtime safety gate.
-        const char* forced_rng = std::getenv("SLIME_GPU_V34_RNG");
-        if (g_v34_rng_override >= 0) {
-            v34_rng = g_v34_rng_override;
+        const char* forced_rng = std::getenv("SLIME_GPU_V1_RNG");
+        if (!forced_rng) forced_rng = std::getenv("SLIME_GPU_V34_RNG");
+        if (g_v1_rng_override >= 0) {
+            v1_rng = g_v1_rng_override;
         } else if (forced_rng && (std::strcmp(forced_rng, "truncated") == 0 ||
                                   std::strcmp(forced_rng, "trunc") == 0 ||
                                   std::strcmp(forced_rng, "2") == 0)) {
-            v34_rng = 2;
+            v1_rng = 2;
         } else if (forced_rng && (std::strcmp(forced_rng, "limb32") == 0 ||
                            std::strcmp(forced_rng, "1") == 0)) {
-            v34_rng = 1;
+            v1_rng = 1;
         } else if (forced_rng && (std::strcmp(forced_rng, "native") == 0 ||
                                   std::strcmp(forced_rng, "baseline") == 0 ||
                                   std::strcmp(forced_rng, "0") == 0)) {
-            v34_rng = 0;
+            v1_rng = 0;
         } else {
             static uint8_t tuned_rng[32][2] = {};
             const int32_t slot = std::max(0, std::min(31, device));
             const int32_t bucket = min_size <= 45 ? 0 : 1;
             if (tuned_rng[slot][bucket] != 0) {
-                v34_rng = (int32_t)tuned_rng[slot][bucket] - 1;
+                v1_rng = (int32_t)tuned_rng[slot][bucket] - 1;
             } else if ((int64_t)width * height >= 100000000000LL) {
                 const int32_t sample_width = std::min(width, 262144);
                 const int32_t sample_height = std::min(height, BAND_H * 8);
@@ -1227,30 +1242,30 @@ extern "C" {
                 const bool events_ok = cudaEventCreate(&start) == cudaSuccess &&
                                        cudaEventCreate(&stop) == cudaSuccess;
                 auto time_rng = [&](int32_t rng, float& ms,
-                                    uint32_t& exact_count,
-                                    uint32_t& stored_count) -> bool {
-                    exact_count = 0U;
-                    stored_count = 0U;
+                                    unsigned long long& exact_count,
+                                    unsigned long long& stored_count) -> bool {
+                    exact_count = 0ULL;
+                    stored_count = 0ULL;
                     if (!events_ok ||
-                        cudaMemset(d_found_count, 0, sizeof(uint32_t)) != cudaSuccess ||
-                        cudaMemset(d_emitted_count, 0, sizeof(uint32_t)) != cudaSuccess ||
+                        cudaMemset(d_found_count, 0, sizeof(unsigned long long)) != cudaSuccess ||
+                        cudaMemset(d_emitted_count, 0, sizeof(unsigned long long)) != cudaSuccess ||
                         cudaEventRecord(start) != cudaSuccess ||
-                        launch_v34(v34_shape, rng, 0, sample_width, sample_height,
+                        launch_v1(v1_shape, rng, 0, sample_width, sample_height,
                                    sample_tiles_x, sample_tiles_z, sample_blocks,
                                    tune_emit_min) != cudaSuccess ||
                         cudaEventRecord(stop) != cudaSuccess ||
                         cudaEventSynchronize(stop) != cudaSuccess ||
                         cudaEventElapsedTime(&ms, start, stop) != cudaSuccess ||
-                        cudaMemcpy(&exact_count, d_found_count, sizeof(uint32_t),
+                        cudaMemcpy(&exact_count, d_found_count, sizeof(unsigned long long),
                                    cudaMemcpyDeviceToHost) != cudaSuccess ||
-                        cudaMemcpy(&stored_count, d_emitted_count, sizeof(uint32_t),
+                        cudaMemcpy(&stored_count, d_emitted_count, sizeof(unsigned long long),
                                    cudaMemcpyDeviceToHost) != cudaSuccess)
                         return false;
                     return true;
                 };
 
                 float warm_ms = 0.0f;
-                uint32_t warm_exact = 0U, warm_stored = 0U;
+                unsigned long long warm_exact = 0ULL, warm_stored = 0ULL;
                 const bool warm_ok =
                     time_rng(0, warm_ms, warm_exact, warm_stored) &&
                     time_rng(1, warm_ms, warm_exact, warm_stored) &&
@@ -1258,12 +1273,12 @@ extern "C" {
                 float native_a = 0.0f, native_b = 0.0f;
                 float limb_a = 0.0f, limb_b = 0.0f;
                 float trunc_a = 0.0f, trunc_b = 0.0f;
-                uint32_t native_exact_a = 0U, native_exact_b = 0U;
-                uint32_t native_stored_a = 0U, native_stored_b = 0U;
-                uint32_t limb_exact_a = 0U, limb_exact_b = 0U;
-                uint32_t limb_stored_a = 0U, limb_stored_b = 0U;
-                uint32_t trunc_exact_a = 0U, trunc_exact_b = 0U;
-                uint32_t trunc_stored_a = 0U, trunc_stored_b = 0U;
+                unsigned long long native_exact_a = 0ULL, native_exact_b = 0ULL;
+                unsigned long long native_stored_a = 0ULL, native_stored_b = 0ULL;
+                unsigned long long limb_exact_a = 0ULL, limb_exact_b = 0ULL;
+                unsigned long long limb_stored_a = 0ULL, limb_stored_b = 0ULL;
+                unsigned long long trunc_exact_a = 0ULL, trunc_exact_b = 0ULL;
+                unsigned long long trunc_stored_a = 0ULL, trunc_stored_b = 0ULL;
                 const bool measured = warm_ok &&
                     time_rng(0, native_a, native_exact_a, native_stored_a) &&
                     time_rng(1, limb_a, limb_exact_a, limb_stored_a) &&
@@ -1292,17 +1307,17 @@ extern "C" {
                         best_alt = trunc_avg;
                         best_mode = 2;
                     }
-                    v34_rng = best_alt < native_avg * 0.97f ? best_mode : 0;
+                    v1_rng = best_alt < native_avg * 0.97f ? best_mode : 0;
                 } else {
-                    v34_rng = 0;
+                    v1_rng = 0;
                 }
                 if (start) cudaEventDestroy(start);
                 if (stop) cudaEventDestroy(stop);
                 cudaGetLastError();
-                tuned_rng[slot][bucket] = (uint8_t)(v34_rng + 1);
+                tuned_rng[slot][bucket] = (uint8_t)(v1_rng + 1);
             }
         }
-        g_v34_last_rng = v34_rng;
+        g_v1_last_rng = v1_rng;
 
         const int32_t tiles_x = (width + out_tile_width - 1) / out_tile_width;
         bool failed = false;
@@ -1332,12 +1347,13 @@ extern "C" {
             for (auto& bucket : score_buckets) bucket.clear();
 
             for (int32_t z_offset = 0; z_offset < height;) {
-                while (g_pause_requested && !g_cancel_requested)
+                while (g_pause_requested.load(std::memory_order_relaxed) &&
+                       !g_cancel_requested.load(std::memory_order_relaxed))
                     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                if (g_cancel_requested) break;
+                if (g_cancel_requested.load(std::memory_order_relaxed)) break;
                 int32_t out_height = std::min(slab_height, height - z_offset);
-                if (cudaMemset(d_found_count, 0, sizeof(uint32_t)) != cudaSuccess ||
-                    cudaMemset(d_emitted_count, 0, sizeof(uint32_t)) != cudaSuccess) {
+                if (cudaMemset(d_found_count, 0, sizeof(unsigned long long)) != cudaSuccess ||
+                    cudaMemset(d_emitted_count, 0, sizeof(unsigned long long)) != cudaSuccess) {
                     failed = true;
                     break;
                 }
@@ -1346,7 +1362,7 @@ extern "C" {
                 int32_t blocks = (int32_t)std::min<int64_t>(8192, total_tiles);
                 cudaError_t launch_status = cudaSuccess;
                 const auto scan_begin = std::chrono::steady_clock::now();
-                launch_status = launch_v34(v34_shape, v34_rng, z_offset, width, out_height,
+                launch_status = launch_v1(v1_shape, v1_rng, z_offset, width, out_height,
                                            tiles_x, tiles_z, blocks, emit_min_size);
                 cudaError_t sync_status = cudaDeviceSynchronize();
                 const auto scan_end = std::chrono::steady_clock::now();
@@ -1357,16 +1373,16 @@ extern "C" {
                 const int64_t scan_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(scan_end - scan_begin).count();
                 g_processed_centers.fetch_add((int64_t)out_height * (int64_t)width, std::memory_order_relaxed);
                 g_gpu_scan_work_ns.fetch_add(std::max<int64_t>(1, scan_ns), std::memory_order_relaxed);
-                uint32_t slab_found_count = 0;
-                uint32_t slab_stored_count = 0;
-                if (cudaMemcpy(&slab_stored_count, d_emitted_count, sizeof(uint32_t),
+                unsigned long long slab_found_count = 0ULL;
+                unsigned long long slab_stored_count = 0ULL;
+                if (cudaMemcpy(&slab_stored_count, d_emitted_count, sizeof(unsigned long long),
                                cudaMemcpyDeviceToHost) != cudaSuccess) {
                     failed = true;
                     break;
                 }
                 if (emit_min_size == min_size) {
                     slab_found_count = slab_stored_count;
-                } else if (cudaMemcpy(&slab_found_count, d_found_count, sizeof(uint32_t),
+                } else if (cudaMemcpy(&slab_found_count, d_found_count, sizeof(unsigned long long),
                                       cudaMemcpyDeviceToHost) != cudaSuccess) {
                     failed = true;
                     break;
@@ -1375,7 +1391,7 @@ extern "C" {
                 // A slab must fit completely so no materialized candidate can
                 // disappear before ranking. Dense lower scores are counted but
                 // intentionally do not consume result-buffer space.
-                if (slab_stored_count > (uint32_t)gpu_buffer_cap) {
+                if (slab_stored_count > (unsigned long long)gpu_buffer_cap) {
                     if (out_height <= BAND_H) {
                         failed = true;
                         break;
@@ -1417,10 +1433,12 @@ extern "C" {
                     }
                 }
                 z_offset += out_height;
-                g_progress = 1 + (int32_t)(((int64_t)z_offset * 79) / std::max(1, height));
+                g_progress.store(
+                    1 + (int32_t)(((int64_t)z_offset * 79) / std::max(1, height)),
+                    std::memory_order_relaxed);
             }
 
-            if (failed || g_cancel_requested || emit_min_size <= min_size) break;
+            if (failed || g_cancel_requested.load(std::memory_order_relaxed) || emit_min_size <= min_size) break;
             size_t retained = 0;
             for (const auto& bucket : score_buckets) retained += bucket.size();
             const size_t needed = (size_t)std::min<int64_t>(absolute_found_count, max_results);
@@ -1429,9 +1447,9 @@ extern "C" {
         }
 
         if (failed) {
-            release_v34();
+            release_v1();
             cudaGetLastError();
-            g_progress = 0;
+            g_progress.store(0, std::memory_order_relaxed);
             return -1;
         }
 
@@ -1458,7 +1476,7 @@ extern "C" {
             memcpy(results_buffer, ranked.data(), (size_t)copy_to_python * sizeof(ExtChunkResult));
 
             int32_t eval_count = 0;
-            if (precise_afk != 0 && !g_cancel_requested) {
+            if (precise_afk != 0 && !g_cancel_requested.load(std::memory_order_relaxed)) {
                 eval_count = std::min(copy_to_python, 100);
                 ExtChunkResult* d_top = nullptr;
                 if (eval_count > 0 && cudaMalloc(&d_top, (size_t)eval_count * sizeof(ExtChunkResult)) == cudaSuccess) {
@@ -1486,18 +1504,38 @@ extern "C" {
             }
         }
 
-        release_v34();
-        g_progress = 90;
+        release_v1();
+        g_progress.store(90, std::memory_order_relaxed);
         return absolute_found_count;
     }
 
 
+    __declspec(dllexport) int64_t search_slime_clusters_gpu_v1(
+        int64_t seed, int64_t rd_max, int32_t min_size, int32_t max_size, int64_t rd_min,
+        ExtChunkResult* results_buffer, int32_t max_results, int32_t precise_afk
+    ) {
+        return search_slime_clusters_gpu_v1_impl(
+            seed, rd_max, min_size, max_size, rd_min, 0, 0,
+            results_buffer, max_results, precise_afk);
+    }
+
+    __declspec(dllexport) int64_t search_slime_clusters_gpu_v1_centered(
+        int64_t seed, int64_t rd_max, int32_t min_size, int32_t max_size, int64_t rd_min,
+        int32_t search_center_x, int32_t search_center_z,
+        ExtChunkResult* results_buffer, int32_t max_results, int32_t precise_afk
+    ) {
+        return search_slime_clusters_gpu_v1_impl(
+            seed, rd_max, min_size, max_size, rd_min, search_center_x, search_center_z,
+            results_buffer, max_results, precise_afk);
+    }
+
+    // Legacy ABI aliases for older frontends.
     __declspec(dllexport) int64_t search_slime_clusters_gpu_v34(
         int64_t seed, int64_t rd_max, int32_t min_size, int32_t max_size, int64_t rd_min,
         ExtChunkResult* results_buffer, int32_t max_results, int32_t precise_afk
     ) {
-        return search_slime_clusters_gpu_v34_impl(
-            seed, rd_max, min_size, max_size, rd_min, 0, 0,
+        return search_slime_clusters_gpu_v1(
+            seed, rd_max, min_size, max_size, rd_min,
             results_buffer, max_results, precise_afk);
     }
 
@@ -1506,7 +1544,7 @@ extern "C" {
         int32_t search_center_x, int32_t search_center_z,
         ExtChunkResult* results_buffer, int32_t max_results, int32_t precise_afk
     ) {
-        return search_slime_clusters_gpu_v34_impl(
+        return search_slime_clusters_gpu_v1_centered(
             seed, rd_max, min_size, max_size, rd_min, search_center_x, search_center_z,
             results_buffer, max_results, precise_afk);
     }
@@ -1515,7 +1553,7 @@ extern "C" {
     __declspec(dllexport) void refine_candidates_y(int64_t seed, ExtChunkResult* results_buffer, int32_t count) {
         if (!results_buffer || count <= 0) return;
         if (!g_gpu_y_tables_ready) rebuild_gpu_y_tables();
-        g_progress = 90;
+        g_progress.store(90, std::memory_order_relaxed);
         ExtChunkResult* d_top_results = nullptr;
         if (cudaMalloc(&d_top_results, count * sizeof(ExtChunkResult)) != cudaSuccess) return;
         if (cudaMemcpy(d_top_results, results_buffer, count * sizeof(ExtChunkResult), cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -1542,6 +1580,6 @@ extern "C" {
             cudaMemcpy(results_buffer, d_top_results, count * sizeof(ExtChunkResult), cudaMemcpyDeviceToHost);
         }
         cudaFree(d_top_results);
-        g_progress = 99;
+        g_progress.store(99, std::memory_order_relaxed);
     }
 }

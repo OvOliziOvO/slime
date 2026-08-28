@@ -131,9 +131,11 @@ Minecraft 的史莱姆区块判定最终依赖 Java 48 位 LCG 和 `nextInt(10)`
 调试时可以通过环境变量强制指定实现：
 
 ```powershell
-$env:SLIME_GPU_V34_SHAPE = "256x4"
-$env:SLIME_GPU_V34_RNG = "native"  # native / limb32 / truncated
+$env:SLIME_GPU_V1_SHAPE = "256x4"
+$env:SLIME_GPU_V1_RNG = "native"  # native / limb32 / truncated
 ```
+
+旧的 `SLIME_GPU_V34_*` 环境变量仍作为兼容别名保留，但当前公开算法版本统一称为 **V1**。
 
 ## CPU 实现
 
@@ -154,7 +156,24 @@ V1 使用一个统一发行包 `SlimeFinder_NVIDIA_10_50.exe`，包含 GTX 10、
 
 ## 下载与使用
 
-普通用户请从 [Releases](https://github.com/gmx201009-code/slime/releases/latest) 下载 `SlimeFinder_NVIDIA_10_50.exe`。一个文件覆盖 GTX 10 到 RTX 50 系，无需手动选择架构版本。
+普通用户请从 [Releases](https://github.com/OvOliziOvO/slime/releases/latest) 下载 `SlimeFinder_NVIDIA_10_50.exe`。一个文件覆盖 GTX 10 到 RTX 50 系，无需手动选择架构版本。
+
+### 可选：噪声 / 群系检查
+
+史莱姆区块本身只依赖 Java 版固定的史莱姆 RNG，**不需要 cubiomes**。深谙之域、蘑菇岛等世界生成检查需要外置 `cubiomes.dll`。
+
+- 上游源码 / 下载入口：[Conflux-Union/cubiomes](https://github.com/Conflux-Union/cubiomes)
+- 将编译得到的 `cubiomes.dll` 放到 `SlimeFinder_NVIDIA_10_50.exe` 或 `SlimeFinder.py` 同目录即可。
+- 本项目的 Release EXE 不内置 `cubiomes.dll`；前端检测不到它时会显示“下载噪声检查组件”按钮并打开上述地址。
+- cubiomes 上游使用 MIT License；本项目仍选择不把第三方 DLL 直接塞进 EXE，用户可按上游许可证自行获取或构建。
+
+### 为什么群系检查可能比 GPU 主搜索还慢？
+
+这是两类完全不同的计算。V1 的 GPU 主搜索只需要大量并行计算史莱姆 RNG 和 17×17 精确圆形统计，非常适合 CUDA；深谙/蘑菇岛检查则需要 cubiomes 在 CPU 上计算 Minecraft 世界生成噪声与群系。
+
+深谙检查还要针对候选周围真正属于史莱姆的区块，在多个 Y 层和完整 `4×4` quart 位置上检查群系。为了保证准确性，不能退回早期只抽样 `2×2` quart 点的做法。因此单个候选的群系验证远比一次史莱姆 RNG 判定昂贵。
+
+当前流程已经先完成 V1 精准排序，再从第 1 名开始检查群系；一旦凑够用户要求的 Top-N 有效结果就立即停止，不会再无意义地把整个候选池全部检查完。文本种子（例如 `A`）会按 Minecraft 规则转换为数字种子，并不会让群系检查本身变慢。
 
 仓库只保留算法源文件和 Python 前端代码，不包含本地构建脚本或编译产物：
 
@@ -174,7 +193,7 @@ python -m pip install -r requirements.txt
 python .\SlimeFinder.py
 ```
 
-`cubiomes.dll` 只用于可选的群系检查。没有它时，史莱姆区块搜索仍可正常运行，但相关群系功能不可用。
+`cubiomes.dll` 只用于可选的噪声 / 群系检查。没有它时，史莱姆区块搜索仍可正常运行，但相关群系功能不可用。
 
 ## 正确性验证
 
