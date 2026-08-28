@@ -6,12 +6,15 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <thread>
+#include <chrono>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <immintrin.h>
 #endif
 
 static std::atomic<int> g_cancel_requested{0};
+static std::atomic<int> g_pause_requested{0};
 static std::atomic<int> g_progress{0};
 static std::atomic<int> g_y_scan_enabled{0};
 static int32_t g_platform_y = -64;
@@ -328,10 +331,20 @@ int32_t calc_spawnable_spaces(int64_t seed, int64_t ox, int64_t oz, int32_t afk_
 extern "C" {
     __declspec(dllexport) void request_cancel() {
         g_cancel_requested.store(1, std::memory_order_relaxed);
+        g_pause_requested.store(0, std::memory_order_relaxed);
+    }
+
+    __declspec(dllexport) void request_pause() {
+        g_pause_requested.store(1, std::memory_order_relaxed);
+    }
+
+    __declspec(dllexport) void resume_search() {
+        g_pause_requested.store(0, std::memory_order_relaxed);
     }
 
     __declspec(dllexport) void reset_cancel() {
         g_cancel_requested.store(0, std::memory_order_relaxed);
+        g_pause_requested.store(0, std::memory_order_relaxed);
         g_progress.store(0, std::memory_order_relaxed);
     }
 
@@ -348,8 +361,9 @@ extern "C" {
         rebuild_y_radius_tables();
     }
 
-    __declspec(dllexport) int64_t search_slime_clusters(
+    static int64_t search_slime_clusters_impl(
         int64_t seed, int64_t rd_max, int32_t min_size, int32_t max_size, int64_t rd_min,
+        int32_t search_center_x, int32_t search_center_z,
         ExtChunkResult* results_buffer, int32_t max_results, int32_t threads, int32_t precise_afk
     ) {
         if (!results_buffer || max_results <= 0 || rd_max < 0) return 0;
@@ -359,6 +373,10 @@ extern "C" {
         omp_set_num_threads(threads);
         const int64_t SUBGRID = 256;
         const int64_t grid_width = rd_max * 2 + 1;
+        const int64_t search_min_x = (int64_t)search_center_x - rd_max;
+        const int64_t search_max_x = (int64_t)search_center_x + rd_max;
+        const int64_t search_min_z = (int64_t)search_center_z - rd_max;
+        const int64_t search_max_z = (int64_t)search_center_z + rd_max;
         const int64_t num_tasks_x = (grid_width + SUBGRID - 1) / SUBGRID;
         const int64_t num_tasks_z = (grid_width + SUBGRID - 1) / SUBGRID;
         const int64_t total_tasks = num_tasks_x * num_tasks_z;
@@ -385,16 +403,19 @@ extern "C" {
 
             #pragma omp for schedule(dynamic, 1)
             for (int64_t task_idx = 0; task_idx < total_tasks; ++task_idx) {
+                while (g_pause_requested.load(std::memory_order_relaxed) &&
+                       !g_cancel_requested.load(std::memory_order_relaxed))
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 if (g_cancel_requested.load(std::memory_order_relaxed)) continue;
                 if ((task_idx & 15) == 0) {
                     int32_t pct = 1 + (int32_t)((task_idx * 79) / std::max<int64_t>(1, total_tasks));
                     int32_t old = g_progress.load(std::memory_order_relaxed);
                     if (pct > old) g_progress.store(pct, std::memory_order_relaxed);
                 }
-                int64_t cx_start = -rd_max + (task_idx % num_tasks_x) * SUBGRID;
-                int64_t cz_start = -rd_max + (task_idx / num_tasks_x) * SUBGRID;
-                int64_t cx_end = std::min(cx_start + SUBGRID - 1, rd_max);
-                int64_t cz_end = std::min(cz_start + SUBGRID - 1, rd_max);
+                int64_t cx_start = search_min_x + (task_idx % num_tasks_x) * SUBGRID;
+                int64_t cz_start = search_min_z + (task_idx / num_tasks_x) * SUBGRID;
+                int64_t cx_end = std::min(cx_start + SUBGRID - 1, search_max_x);
+                int64_t cz_end = std::min(cz_start + SUBGRID - 1, search_max_z);
 
                 int64_t px_start = cx_start - 8;
                 int64_t pz_start = cz_start - 8;
@@ -460,10 +481,17 @@ extern "C" {
                 }
 
                 for (int64_t cx = cx_start; cx <= cx_end; ++cx) {
+                    while (g_pause_requested.load(std::memory_order_relaxed) &&
+                           !g_cancel_requested.load(std::memory_order_relaxed))
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
                     if (g_cancel_requested.load(std::memory_order_relaxed)) break;
                     int64_t xi = cx - px_start;
                     for (int64_t cz = cz_start; cz <= cz_end; ++cz) {
-                        if (rd_min > 0 && cx*cx + cz*cz < rd_min_sq) continue;
+                        if (rd_min > 0) {
+                            const int64_t dx = cx - (int64_t)search_center_x;
+                            const int64_t dz = cz - (int64_t)search_center_z;
+                            if (dx * dx + dz * dz < rd_min_sq) continue;
+                        }
                         int64_t zi = cz - pz_start;
 
                         if (use_square_prefilter) {
@@ -588,6 +616,24 @@ extern "C" {
         return absolute_total_found;
     }
 
+    __declspec(dllexport) int64_t search_slime_clusters(
+        int64_t seed, int64_t rd_max, int32_t min_size, int32_t max_size, int64_t rd_min,
+        ExtChunkResult* results_buffer, int32_t max_results, int32_t threads, int32_t precise_afk
+    ) {
+        return search_slime_clusters_impl(
+            seed, rd_max, min_size, max_size, rd_min, 0, 0,
+            results_buffer, max_results, threads, precise_afk);
+    }
+
+    __declspec(dllexport) int64_t search_slime_clusters_centered(
+        int64_t seed, int64_t rd_max, int32_t min_size, int32_t max_size, int64_t rd_min,
+        int32_t search_center_x, int32_t search_center_z,
+        ExtChunkResult* results_buffer, int32_t max_results, int32_t threads, int32_t precise_afk
+    ) {
+        return search_slime_clusters_impl(
+            seed, rd_max, min_size, max_size, rd_min, search_center_x, search_center_z,
+            results_buffer, max_results, threads, precise_afk);
+    }
 
 
     __declspec(dllexport) void score_candidates_precise(

@@ -631,6 +631,7 @@ GPU_DRIVER_MSG = "未检测到 CUDA 驱动。"
 GPU_AVAILABLE = False
 GPU_STATUS_MSG = "GPU 算法未检测。"
 GPU_DEVICE_COUNT = None
+GPU_DEVICE_NAME = "NVIDIA GPU"
 GPU_V34_ALGORITHM = "GPU 方形滚动 + 角落差分精确圆形 + 全局 Top-K"
 
 def detect_cuda_driver():
@@ -708,12 +709,18 @@ else:
             ctypes.c_int64, ctypes.c_int64, ctypes.c_int32, ctypes.c_int32,
             ctypes.c_int64, ctypes.POINTER(ExtChunkResult), ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
         _cpu.search_slime_clusters.restype = ctypes.c_int64
+        if hasattr(_cpu, "search_slime_clusters_centered"):
+            _cpu.search_slime_clusters_centered.argtypes = [
+                ctypes.c_int64, ctypes.c_int64, ctypes.c_int32, ctypes.c_int32,
+                ctypes.c_int64, ctypes.c_int32, ctypes.c_int32,
+                ctypes.POINTER(ExtChunkResult), ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
+            _cpu.search_slime_clusters_centered.restype = ctypes.c_int64
 
         if hasattr(_cpu, "is_slime_chunk_c"):
             _cpu.is_slime_chunk_c.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
             _cpu.is_slime_chunk_c.restype = ctypes.c_bool
             is_slime_chunk_fast = _cpu.is_slime_chunk_c
-        for func in ["request_cancel", "reset_cancel"]:
+        for func in ["request_cancel", "reset_cancel", "request_pause", "resume_search"]:
             if hasattr(_cpu, func):
                 getattr(_cpu, func).argtypes = []
                 getattr(_cpu, func).restype = None
@@ -747,12 +754,18 @@ if os.path.exists(GPU_DLL):
             ctypes.c_int64, ctypes.c_int64, ctypes.c_int32, ctypes.c_int32,
             ctypes.c_int64, ctypes.POINTER(ExtChunkResult), ctypes.c_int32, ctypes.c_int32]
         sc_gpu_lib.search_slime_clusters_gpu_v34.restype = ctypes.c_int64
+        if hasattr(sc_gpu_lib, "search_slime_clusters_gpu_v34_centered"):
+            sc_gpu_lib.search_slime_clusters_gpu_v34_centered.argtypes = [
+                ctypes.c_int64, ctypes.c_int64, ctypes.c_int32, ctypes.c_int32,
+                ctypes.c_int64, ctypes.c_int32, ctypes.c_int32,
+                ctypes.POINTER(ExtChunkResult), ctypes.c_int32, ctypes.c_int32]
+            sc_gpu_lib.search_slime_clusters_gpu_v34_centered.restype = ctypes.c_int64
 
         if hasattr(sc_gpu_lib, "is_slime_chunk_c"):
             sc_gpu_lib.is_slime_chunk_c.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
             sc_gpu_lib.is_slime_chunk_c.restype = ctypes.c_bool
             if not is_slime_chunk_fast: is_slime_chunk_fast = sc_gpu_lib.is_slime_chunk_c
-        for func in ["request_cancel", "reset_cancel", "cleanup_gpu_resources"]:
+        for func in ["request_cancel", "reset_cancel", "request_pause", "resume_search", "cleanup_gpu_resources"]:
             if hasattr(sc_gpu_lib, func): getattr(sc_gpu_lib, func).argtypes = []; getattr(sc_gpu_lib, func).restype = None
         if hasattr(sc_gpu_lib, "set_y_scan_config"):
             sc_gpu_lib.set_y_scan_config.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
@@ -763,9 +776,18 @@ if os.path.exists(GPU_DLL):
         if hasattr(sc_gpu_lib, "get_progress"):
             sc_gpu_lib.get_progress.argtypes = []
             sc_gpu_lib.get_progress.restype = ctypes.c_int32
+        if hasattr(sc_gpu_lib, "get_processed_centers"):
+            sc_gpu_lib.get_processed_centers.argtypes = []
+            sc_gpu_lib.get_processed_centers.restype = ctypes.c_int64
+        if hasattr(sc_gpu_lib, "get_gpu_scan_work_ns"):
+            sc_gpu_lib.get_gpu_scan_work_ns.argtypes = []
+            sc_gpu_lib.get_gpu_scan_work_ns.restype = ctypes.c_int64
         if hasattr(sc_gpu_lib, "get_cuda_device_count"):
             sc_gpu_lib.get_cuda_device_count.argtypes = []
             sc_gpu_lib.get_cuda_device_count.restype = ctypes.c_int32
+        if hasattr(sc_gpu_lib, "get_cuda_device_name"):
+            sc_gpu_lib.get_cuda_device_name.argtypes = [ctypes.POINTER(ctypes.c_char), ctypes.c_int32]
+            sc_gpu_lib.get_cuda_device_name.restype = ctypes.c_int32
         if hasattr(sc_gpu_lib, "get_gpu_v34_shape"):
             sc_gpu_lib.get_gpu_v34_shape.argtypes = []
             sc_gpu_lib.get_gpu_v34_shape.restype = ctypes.c_int32
@@ -797,6 +819,14 @@ if sc_gpu_lib:
 else:
     GPU_AVAILABLE = False
     GPU_STATUS_MSG = "未加载 slimecore_gpu.dll。"
+
+if sc_gpu_lib and GPU_AVAILABLE and hasattr(sc_gpu_lib, "get_cuda_device_name"):
+    try:
+        _gpu_name_buf = ctypes.create_string_buffer(256)
+        if int(sc_gpu_lib.get_cuda_device_name(_gpu_name_buf, len(_gpu_name_buf))) > 0:
+            GPU_DEVICE_NAME = _gpu_name_buf.value.decode("utf-8", errors="replace").strip() or GPU_DEVICE_NAME
+    except Exception:
+        pass
 
 # If CPU is absent and GPU is not usable, do not let Python fallback silently use
 # a host helper from the unavailable GPU DLL as its slime-check algorithm.
@@ -1063,11 +1093,18 @@ def score_candidates_precise_native(seed, candidates, threads, progress_cb=None,
 def read_native_candidates(buffer, count, seed, scan_y=False):
     return [(buffer[i].size, buffer[i].afk_x, buffer[i].afk_z, buffer[i].center_x // 16, buffer[i].center_z // 16, seed, unpack_obs_y(buffer[i].obs_count, scan_y)[0], unpack_obs_y(buffer[i].obs_count, scan_y)[1]) for i in range(count)]
 
-def run_gpu_scan(seed, rd_max, min_size, max_size, rd_min, buf_size, precise):
+def run_gpu_scan(seed, rd_max, min_size, max_size, rd_min, buf_size, precise, center_cx=0, center_cz=0):
     buffer = (ExtChunkResult * buf_size)()
     seed_i64 = normalize_java_seed(seed)
-    found_count = sc_gpu_lib.search_slime_clusters_gpu_v34(
-        seed_i64, rd_max, min_size, max_size, rd_min, buffer, buf_size, precise)
+    if hasattr(sc_gpu_lib, "search_slime_clusters_gpu_v34_centered"):
+        found_count = sc_gpu_lib.search_slime_clusters_gpu_v34_centered(
+            seed_i64, rd_max, min_size, max_size, rd_min,
+            int(center_cx), int(center_cz), buffer, buf_size, precise)
+    elif int(center_cx) == 0 and int(center_cz) == 0:
+        found_count = sc_gpu_lib.search_slime_clusters_gpu_v34(
+            seed_i64, rd_max, min_size, max_size, rd_min, buffer, buf_size, precise)
+    else:
+        raise RuntimeError("当前 GPU DLL 版本不支持自定义搜索中心，请重新编译/更新 slimecore_gpu.dll。")
     if found_count < 0:
         raise RuntimeError("当前 GPU 精确算法执行失败；正式版不包含旧算法回退。")
     algorithm = GPU_V34_ALGORITHM
@@ -1083,14 +1120,22 @@ def run_gpu_scan(seed, rd_max, min_size, max_size, rd_min, buf_size, precise):
     extract_count = max(0, min(int(found_count), buf_size))
     return read_native_candidates(buffer, extract_count, seed_i64, False), found_count, algorithm
 
-def run_cpu_scan(seed, rd_max, min_size, max_size, rd_min, buf_size, threads, precise):
+def run_cpu_scan(seed, rd_max, min_size, max_size, rd_min, buf_size, threads, precise, center_cx=0, center_cz=0):
     buffer = (ExtChunkResult * buf_size)()
     seed_i64 = normalize_java_seed(seed)
-    found_count = sc_cpu_lib.search_slime_clusters(seed_i64, rd_max, min_size, max_size, rd_min, buffer, buf_size, threads, precise)
+    if hasattr(sc_cpu_lib, "search_slime_clusters_centered"):
+        found_count = sc_cpu_lib.search_slime_clusters_centered(
+            seed_i64, rd_max, min_size, max_size, rd_min,
+            int(center_cx), int(center_cz), buffer, buf_size, threads, precise)
+    elif int(center_cx) == 0 and int(center_cz) == 0:
+        found_count = sc_cpu_lib.search_slime_clusters(
+            seed_i64, rd_max, min_size, max_size, rd_min, buffer, buf_size, threads, precise)
+    else:
+        raise RuntimeError("当前 CPU DLL 版本不支持自定义搜索中心，请重新编译/更新 slimecore.dll。")
     extract_count = max(0, min(int(found_count), buf_size))
     return read_native_candidates(buffer, extract_count, seed_i64, False), found_count
 
-def search_slime_clusters_py(seed, rd_max, min_size, max_size, rd_min, buf_size, c_obj=None, is_precise=True):
+def search_slime_clusters_py(seed, rd_max, min_size, max_size, rd_min, buf_size, c_obj=None, is_precise=True, center_cx=0, center_cz=0):
     import heapq
     rd_min_sq = float(rd_min * rd_min)
     spawn_x, spawn_z = get_world_spawn(seed)
@@ -1105,11 +1150,15 @@ def search_slime_clusters_py(seed, rd_max, min_size, max_size, rd_min, buf_size,
         elif key > leaderboard[0][0]:
             heapq.heapreplace(leaderboard, (key, item))
 
-    for row_idx, cx in enumerate(range(-rd_max, rd_max + 1)):
+    min_cx, max_cx = int(center_cx) - rd_max, int(center_cx) + rd_max
+    min_cz, max_cz = int(center_cz) - rd_max, int(center_cz) + rd_max
+    for row_idx, cx in enumerate(range(min_cx, max_cx + 1)):
+        while c_obj and c_obj.pause and not c_obj.cancel:
+            time.sleep(0.05)
         if c_obj and c_obj.cancel: break
         if c_obj and row_idx % max(1, (total_rows // 20)) == 0: c_obj.p.emit(10 + int(row_idx / total_rows * 30))
-        for cz in range(-rd_max, rd_max + 1):
-            if rd_min > 0 and (float(cx) * float(cx) + float(cz) * float(cz) < rd_min_sq): continue
+        for cz in range(min_cz, max_cz + 1):
+            if rd_min > 0 and ((float(cx - center_cx) ** 2 + float(cz - center_cz) ** 2) < rd_min_sq): continue
             count = sum(1 for dx in range(-8, 9) for dz in range(-8, 9) if dx*dx + dz*dz <= 68 and is_slime_chunk(seed, cx + dx, cz + dz))
             if min_size <= count <= max_size:
                 absolute_total += 1
@@ -1204,6 +1253,8 @@ class Config:
                     self.min_size = data.get('min', 40)
                     self.last_seed = data.get('last_seed', '')
                     self.last_radius = data.get('last_radius', '512')
+                    self.search_center_x = int(data.get('search_center_x', 0))
+                    self.search_center_z = int(data.get('search_center_z', 0))
                     self.min_search_radius = data.get('min_search_radius', 0)
                     self.threads = min(clamp_int(data.get('threads', max(1, int(self.max_sys_threads * 0.8))), max(1, int(self.max_sys_threads * 0.8)), 1, self.max_sys_threads), self.max_sys_threads)
                     self.selected_engine = data.get('selected_engine', "Auto")
@@ -1225,6 +1276,7 @@ class Config:
     def set_defaults(self):
         self.use_range, self.use_min_radius, self.max_size, self.min_size = False, False, 100, 40
         self.last_seed, self.last_radius, self.min_search_radius = '', '512', 0
+        self.search_center_x, self.search_center_z = 0, 0
         self.threads = max(1, int(self.max_sys_threads * 0.8))
         self.selected_engine, self.precise_afk, self.scan_y = "Auto", True, False
         self.result_limit = DEFAULT_RESULT_LIMIT
@@ -1240,6 +1292,8 @@ class Config:
                     'use_range': self.use_range, 'use_min_radius': self.use_min_radius,
                     'max': self.max_size, 'min': self.min_size,
                     'last_seed': self.last_seed, 'last_radius': self.last_radius,
+                    'search_center_x': getattr(self, 'search_center_x', 0),
+                    'search_center_z': getattr(self, 'search_center_z', 0),
                     'min_search_radius': self.min_search_radius, 'threads': self.threads,
                     'selected_engine': getattr(self, 'selected_engine', "Auto"),
                     'precise_afk': getattr(self, 'precise_afk', True),
@@ -1261,8 +1315,9 @@ class C(QObject):
     widget_text = pyqtSignal(object, str)
     native_scan_state = pyqtSignal(bool, str, float, float, int, object)
     cancel = False
+    pause = False
 
-def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choice, is_precise, scan_y, result_limit=DEFAULT_RESULT_LIMIT, is_dd_checked=None):
+def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choice, is_precise, scan_y, result_limit=DEFAULT_RESULT_LIMIT, is_dd_checked=None, center_cx=0, center_cz=0):
     result_limit = max(1, min(MAX_RESULT_LIMIT, int(result_limit or DEFAULT_RESULT_LIMIT)))
     def emit_progress(value):
         try:
@@ -1601,6 +1656,10 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
         threading.Thread(target=scan_worker, daemon=True).start()
         while not done_event.is_set():
             now = time.time()
+            if getattr(app, "_search_paused", False) and not getattr(app.c, "cancel", False):
+                app.c.t.emit("{} 已暂停 · 点击“继续”恢复".format(label))
+                time.sleep(0.2)
+                continue
             if getattr(app.c, "cancel", False):
                 if native_lib and hasattr(native_lib, "request_cancel"):
                     try:
@@ -1722,7 +1781,9 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
                 scan_result = run_native_scan_with_heartbeat(
                     "GPU",
                     sd,
-                    lambda sd=sd: run_gpu_scan(sd, rd_max, ms, size_limit, rd_min, buf_size, native_precise),
+                    lambda sd=sd: run_gpu_scan(
+                        sd, rd_max, ms, size_limit, rd_min, buf_size, native_precise,
+                        center_cx, center_cz),
                     sc_gpu_lib,
                     seed_base_pct,
                     total_seeds,
@@ -1738,7 +1799,9 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
                 candidates, found_count = run_native_scan_with_heartbeat(
                     "CPU",
                     sd,
-                    lambda sd=sd: run_cpu_scan(sd, rd_max, ms, size_limit, rd_min, buf_size, threads, native_precise),
+                    lambda sd=sd: run_cpu_scan(
+                        sd, rd_max, ms, size_limit, rd_min, buf_size, threads, native_precise,
+                        center_cx, center_cz),
                     sc_cpu_lib,
                     seed_base_pct,
                     total_seeds,
@@ -1748,7 +1811,9 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
             else:
                 algorithms_used.add("Python 精确后备模式")
                 app.c.l.emit("启动 Python 后备模式（较慢）...")
-                candidates, found_count = search_slime_clusters_py(sd, rd_max, ms, size_limit, rd_min, buf_size, app.c, is_precise)
+                candidates, found_count = search_slime_clusters_py(
+                    sd, rd_max, ms, size_limit, rd_min, buf_size, app.c, is_precise,
+                    center_cx, center_cz)
                 app.c.l.emit("Python 扫图完成：发现 {:,} 处候选，用时 {}。".format(found_count, format_elapsed(time.time() - start_time)))
 
             if is_precise:
@@ -1917,6 +1982,8 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
         search_params = {
             "seeds": [int(v) for v in seeds],
             "radius": int(rd_max),
+            "center_x": int(getattr(app.config, "search_center_x", int(center_cx) * 16)),
+            "center_z": int(getattr(app.config, "search_center_z", int(center_cz) * 16)),
             "min_radius": int(rd_min),
             "min_size": int(ms),
             "max_size": int(max_s) if use_range else None,
@@ -2105,10 +2172,19 @@ class SlimeApp(QWidget):
         self._native_scan_started = 0.0
         self._native_scan_base_pct = 0.0
         self._native_scan_total_seeds = 1
+        self._native_scan_total_centers = 1
         self._native_scan_label = "原生"
         self._native_scan_lib = None
+        self._gpu_perf_samples = []
+        self._gpu_perf_prev_centers = 0
+        self._gpu_perf_prev_work_ns = 0
+        self._gpu_perf_total_centers = 0
+        self._gpu_perf_total_work_ns = 0
         self._search_in_progress = False
         self._search_started_at = 0.0
+        self._search_paused = False
+        self._pause_started_at = 0.0
+        self._native_pause_accum = 0.0
         self._search_soft_ceiling = 34
         self.c.native_scan_state.connect(self._set_native_scan_state)
 
@@ -2783,6 +2859,48 @@ class SlimeApp(QWidget):
     def _on_manual_done(self, state):
         self._apply_run_state(state)
 
+    def _reset_gpu_perf_stats(self):
+        self._gpu_perf_samples = []
+        self._gpu_perf_prev_centers = 0
+        self._gpu_perf_prev_work_ns = 0
+        self._gpu_perf_total_centers = 0
+        self._gpu_perf_total_work_ns = 0
+
+    def _sample_gpu_perf(self, lib):
+        if not lib or not hasattr(lib, "get_processed_centers") or not hasattr(lib, "get_gpu_scan_work_ns"):
+            return None
+        try:
+            centers = max(0, int(lib.get_processed_centers()))
+            work_ns = max(0, int(lib.get_gpu_scan_work_ns()))
+            prev_centers = int(getattr(self, "_gpu_perf_prev_centers", 0))
+            prev_work_ns = int(getattr(self, "_gpu_perf_prev_work_ns", 0))
+            delta_centers = centers - prev_centers
+            delta_work_ns = work_ns - prev_work_ns
+            self._gpu_perf_prev_centers = centers
+            self._gpu_perf_prev_work_ns = work_ns
+            self._gpu_perf_total_centers = centers
+            self._gpu_perf_total_work_ns = work_ns
+            if delta_centers > 0 and delta_work_ns > 0:
+                rate_b = (delta_centers / (delta_work_ns / 1e9)) / 1e9
+                if rate_b > 0:
+                    self._gpu_perf_samples.append(rate_b)
+                    return rate_b
+        except Exception:
+            pass
+        return None
+
+    def _finish_gpu_perf_stats(self, lib):
+        self._sample_gpu_perf(lib)
+        samples = list(getattr(self, "_gpu_perf_samples", []))
+        total_centers = int(getattr(self, "_gpu_perf_total_centers", 0))
+        total_work_ns = int(getattr(self, "_gpu_perf_total_work_ns", 0))
+        if not samples or total_centers <= 0 or total_work_ns <= 0:
+            return None
+        peak_b = max(samples)
+        low_b = min(samples)
+        avg_b = (total_centers / (total_work_ns / 1e9)) / 1e9
+        return low_b, avg_b, peak_b
+
     def _set_native_scan_state(self, active, label, started, base_pct, total_seeds, lib):
         self._native_scan_active = bool(active)
         self._native_scan_label = label or "原生"
@@ -2791,10 +2909,22 @@ class SlimeApp(QWidget):
         self._native_scan_total_seeds = max(1, int(total_seeds or 1))
         self._native_scan_lib = lib
         if active:
+            self._native_pause_accum = 0.0
+            self._pause_started_at = 0.0
+            if label == "GPU":
+                self._reset_gpu_perf_stats()
             self._set_progress_busy(True)
         else:
             self._set_progress_busy(False)
             try:
+                if label == "GPU" and hasattr(self, "gpu_perf_label") and not getattr(self, "_search_cancelled", False):
+                    stats = self._finish_gpu_perf_stats(lib)
+                    gpu_short_name = GPU_DEVICE_NAME.replace("NVIDIA GeForce ", "").replace("NVIDIA ", "").strip()
+                    if stats:
+                        low_b, avg_b, peak_b = stats
+                        self.gpu_perf_label.setText(f"{gpu_short_name} · {avg_b:.1f} B/s")
+                        self.upd_log(
+                            f"GPU速度统计：峰值 {peak_b:.2f} B/s | 最低 {low_b:.2f} B/s | 平均 {avg_b:.2f} B/s")
                 done_value = int(min(95, self._native_scan_base_pct + 35 / max(1, self._native_scan_total_seeds)))
                 if done_value > self.progress.value():
                     self.progress.setValue(done_value)
@@ -2813,6 +2943,10 @@ class SlimeApp(QWidget):
             running = bool(getattr(self, "_search_in_progress", False))
             if not active and not running:
                 return
+            if bool(getattr(self, "_search_paused", False)):
+                label = getattr(self, "_native_scan_label", "搜索")
+                self.time_label.setText(f"{label} 已暂停 · 点击“继续”恢复")
+                return
 
             if active:
                 started = float(getattr(self, "_native_scan_started", time.time()))
@@ -2830,7 +2964,7 @@ class SlimeApp(QWidget):
                 label = "搜索"
                 lib = None
 
-            elapsed = max(0.001, time.time() - started)
+            elapsed = max(0.001, time.time() - started - float(getattr(self, "_native_pause_accum", 0.0)))
             native_pct = None
             if lib and hasattr(lib, "get_progress"):
                 try:
@@ -2853,6 +2987,12 @@ class SlimeApp(QWidget):
                 value = max(value, min(34, phase))
             if not bool(getattr(self, "_progress_busy", False)) and value > self.progress.value():
                 self.progress.setValue(value)
+
+            if label == "GPU" and hasattr(self, "gpu_perf_label"):
+                gpu_short_name = GPU_DEVICE_NAME.replace("NVIDIA GeForce ", "").replace("NVIDIA ", "").strip()
+                rate_b = self._sample_gpu_perf(lib)
+                if rate_b is not None and rate_b > 0:
+                    self.gpu_perf_label.setText(f"{gpu_short_name} · {rate_b:.1f} B/s")
 
             elapsed_text = format_elapsed(elapsed)
             if native_pct is not None and native_pct > 0:
@@ -3024,6 +3164,19 @@ class SlimeApp(QWidget):
         rad_h.addLayout(rad_max_v)
         left_v.addLayout(rad_h)
 
+        center_h = QHBoxLayout()
+        center_x_v = QVBoxLayout()
+        center_x_v.addWidget(QLabel("搜索中心 X (方块):"))
+        self.search_center_x_input = QLineEdit(str(getattr(self.config, 'search_center_x', 0)))
+        center_x_v.addWidget(self.search_center_x_input)
+        center_h.addLayout(center_x_v)
+        center_z_v = QVBoxLayout()
+        center_z_v.addWidget(QLabel("搜索中心 Z (方块):"))
+        self.search_center_z_input = QLineEdit(str(getattr(self.config, 'search_center_z', 0)))
+        center_z_v.addWidget(self.search_center_z_input)
+        center_h.addLayout(center_z_v)
+        left_v.addLayout(center_h)
+
         self.rad_min_label.setVisible(self.config.use_min_radius)
         self.r_inner.setVisible(self.config.use_min_radius)
 
@@ -3082,10 +3235,10 @@ class SlimeApp(QWidget):
         self.start_button = QPushButton("开始搜索")
         self.start_button.setFixedHeight(35)
         self.start_button.clicked.connect(self.start_work)
-        self.cancel_btn = QPushButton("取消")
+        self.cancel_btn = QPushButton("暂停")
         self.cancel_btn.setFixedHeight(35)
         self.cancel_btn.setEnabled(False)
-        self.cancel_btn.clicked.connect(self.cancel_search)
+        self.cancel_btn.clicked.connect(self.toggle_pause_search)
         btn_h.addWidget(self.start_button)
         btn_h.addWidget(self.cancel_btn)
         left_v.addLayout(btn_h)
@@ -3098,9 +3251,17 @@ class SlimeApp(QWidget):
         self.log.setReadOnly(True)
         left_v.addWidget(self.log)
 
+        progress_h = QHBoxLayout()
+        progress_h.setSpacing(8)
         self.progress = QProgressBar()
         self.progress.setFixedHeight(15)
-        left_v.addWidget(self.progress)
+        progress_h.addWidget(self.progress, 1)
+        gpu_short_name = GPU_DEVICE_NAME.replace("NVIDIA GeForce ", "").replace("NVIDIA ", "").strip()
+        self.gpu_perf_label = QLabel(f"{gpu_short_name} · -- B/s")
+        self.gpu_perf_label.setStyleSheet("color: #7f8a96; font-size: 10px;")
+        self.gpu_perf_label.setVisible(gpu_algorithm_available())
+        progress_h.addWidget(self.gpu_perf_label, 0)
+        left_v.addLayout(progress_h)
 
         layout.addWidget(left_panel)
 
@@ -3774,6 +3935,10 @@ class SlimeApp(QWidget):
                             self.seed_text_edit.setPlainText(str(self.current_seed))
                         if search_params.get("radius") is not None:
                             self.radius_input.setText(str(search_params["radius"]))
+                        if search_params.get("center_x") is not None:
+                            self.search_center_x_input.setText(str(search_params["center_x"]))
+                        if search_params.get("center_z") is not None:
+                            self.search_center_z_input.setText(str(search_params["center_z"]))
                         if search_params.get("min_radius") is not None:
                             self.r_inner.setText(str(search_params["min_radius"]))
                             self.config.use_min_radius = int(search_params["min_radius"]) > 0
@@ -3844,24 +4009,68 @@ class SlimeApp(QWidget):
                         f.write(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]},{r[6] if r[6] is not None else ''},{r[5]},{r[4]//8},{r[5]//8}\n")
             except Exception: pass
 
+    def toggle_pause_search(self):
+        if not getattr(self, "_search_in_progress", False):
+            return
+
+        paused = bool(getattr(self, "_search_paused", False))
+        engine = getattr(self, "active_engine", "")
+        if is_gpu_engine(engine):
+            targets = [sc_gpu_lib]
+        elif engine == "CPU (AVX2/OpenMP)":
+            targets = [sc_cpu_lib]
+        else:
+            targets = []
+
+        if not paused:
+            self._search_paused = True
+            self._pause_started_at = time.time()
+            self.c.pause = True
+            for lib in targets:
+                if lib and hasattr(lib, "request_pause"):
+                    try:
+                        lib.request_pause()
+                    except Exception as e:
+                        self.upd_log(f"暂停原生任务失败: {e}")
+            self.cancel_btn.setText("继续")
+            self.time_label.setText("已暂停 · 点击“继续”恢复")
+            self.upd_log("搜索已暂停，当前进度与候选结果已保留。")
+        else:
+            pause_started = float(getattr(self, "_pause_started_at", time.time()))
+            self._native_pause_accum = float(getattr(self, "_native_pause_accum", 0.0)) + max(0.0, time.time() - pause_started)
+            self._search_paused = False
+            self.c.pause = False
+            for lib in targets:
+                if lib and hasattr(lib, "resume_search"):
+                    try:
+                        lib.resume_search()
+                    except Exception as e:
+                        self.upd_log(f"继续原生任务失败: {e}")
+            self.cancel_btn.setText("暂停")
+            self.time_label.setText("正在继续搜索...")
+            self.upd_log("搜索已继续。")
+
     def cancel_search(self):
+        """Internal hard cancel used for shutdown/compatibility, not the UI pause button."""
         self._search_cancelled = True
+        self._search_paused = False
         self.c.cancel = True
-        self.upd_log("正在请求取消任务...")
+        self.c.pause = False
         for lib in (sc_cpu_lib, sc_gpu_lib):
             if lib and hasattr(lib, "request_cancel"):
                 try:
                     lib.request_cancel()
-                except Exception as e:
-                    self.upd_log(f"取消原生任务失败: {e}")
-        self.cancel_btn.setEnabled(False)
-        self.time_label.setText("正在取消...")
+                except Exception:
+                    pass
 
     def update_time(self, t): self.time_label.setText(t if t else "准备就绪")
 
     def update_btns(self, s):
         self.start_button.setEnabled(s); self.cancel_btn.setEnabled(not s)
         if s:
+            self.cancel_btn.setText("暂停")
+            self._search_paused = False
+            self.c.pause = False
             self._native_scan_active = False
             self._search_in_progress = False
             self.native_progress_timer.stop()
@@ -3873,6 +4082,8 @@ class SlimeApp(QWidget):
 
     def cleanup_runtime(self):
         self.c.cancel = True
+        self.c.pause = False
+        self._search_paused = False
         for t in ['native_progress_timer', '_floor_timer']:
             if hasattr(self, t): getattr(self, t).stop()
         cleanup_native_resources()
@@ -3886,6 +4097,8 @@ class SlimeApp(QWidget):
         self.config.scan_y = self.chk_scan_y.isChecked()
         try:
             self.config.min_size = int(self.m_min.text())
+            self.config.search_center_x = int(self.search_center_x_input.text())
+            self.config.search_center_z = int(self.search_center_z_input.text())
             if self.config.use_range: self.config.max_size = int(self.m_max.text())
             if self.config.use_min_radius: self.config.min_search_radius = int(self.r_inner.text())
         except BaseException: pass
@@ -3978,10 +4191,17 @@ class SlimeApp(QWidget):
             max_s = int(self.m_max.text()) if self.config.use_range else 9999
             rd_max = int(self.radius_input.text())
             rd_min = int(self.r_inner.text()) if self.config.use_min_radius else 0
+            center_block_x = int(self.search_center_x_input.text().strip() or "0")
+            center_block_z = int(self.search_center_z_input.text().strip() or "0")
+            center_cx = center_block_x >> 4
+            center_cz = center_block_z >> 4
             if rd_max <= 0:
                 raise ValueError("最大搜索半径必须大于 0。")
             if rd_min < 0:
                 raise ValueError("最小搜索半径不能小于 0。")
+            if (center_cx - rd_max - 8 < -2147483648 or center_cx + rd_max + 8 > 2147483647 or
+                center_cz - rd_max - 8 < -2147483648 or center_cz + rd_max + 8 > 2147483647):
+                raise ValueError("搜索中心与半径组合超出当前算法支持的区块坐标范围。")
             if ms <= 0:
                 raise ValueError("最小规模必须大于 0。")
             if self.config.use_range and max_s < ms:
@@ -3992,6 +4212,8 @@ class SlimeApp(QWidget):
             self.config.max_size = max_s
             self.config.last_seed = seed_text
             self.config.last_radius = str(rd_max)
+            self.config.search_center_x = center_block_x
+            self.config.search_center_z = center_block_z
             self.config.min_search_radius = rd_min
             self.config.precise_afk = self.chk_precise_afk.isChecked()
             self.config.scan_y = self.chk_scan_y.isChecked()
@@ -4004,11 +4226,22 @@ class SlimeApp(QWidget):
             self.progress.setValue(0)
             self.time_label.setText("准备启动...")
             self.active_engine = engine
+            self._native_scan_total_centers = int(2 * rd_max + 1) ** 2
+            if hasattr(self, "gpu_perf_label"):
+                gpu_short_name = GPU_DEVICE_NAME.replace("NVIDIA GeForce ", "").replace("NVIDIA ", "").strip()
+                self.gpu_perf_label.setVisible(is_gpu_engine(engine))
+                if is_gpu_engine(engine):
+                    self.gpu_perf_label.setText(f"{gpu_short_name} · -- B/s")
             self._search_cancelled = False
+            self._search_paused = False
+            self._pause_started_at = 0.0
+            self._native_pause_accum = 0.0
             self._search_in_progress = True
             self._search_started_at = time.time()
             self.c.cancel = False
+            self.c.pause = False
             self.start_button.setEnabled(False)
+            self.cancel_btn.setText("暂停")
             self.cancel_btn.setEnabled(True)
             self.upd_log(f"准备启动搜索，实际引擎：{engine}")
             self.upd_log(engine_reason)
@@ -4027,7 +4260,12 @@ class SlimeApp(QWidget):
                 self.native_progress_timer.stop()
             self.native_progress_timer.start()
             is_dd_checked = self.chk_dd.isChecked()
-            threading.Thread(target=run_full_logic, args=(self, seeds, rd_max, ms, max_s, self.config.use_range, rd_min, engine, self.config.precise_afk, self.config.scan_y, self.config.result_limit, is_dd_checked), daemon=True).start()
+            threading.Thread(
+                target=run_full_logic,
+                args=(self, seeds, rd_max, ms, max_s, self.config.use_range, rd_min,
+                      engine, self.config.precise_afk, self.config.scan_y,
+                      self.config.result_limit, is_dd_checked, center_cx, center_cz),
+                daemon=True).start()
         except ValueError as e:
             self.upd_log(f"输入错误: {e}")
             QMessageBox.warning(self, "输入错误", str(e))

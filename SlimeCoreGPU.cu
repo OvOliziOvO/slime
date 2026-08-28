@@ -8,9 +8,15 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <thread>
+#include <chrono>
+#include <atomic>
 
 static int g_cancel_requested = 0;
+static int g_pause_requested = 0;
 static int g_progress = 0;
+static std::atomic<int64_t> g_processed_centers{0};
+static std::atomic<int64_t> g_gpu_scan_work_ns{0};
 static int g_y_scan_enabled = 0;
 static int32_t g_platform_y = -64;
 static int32_t g_y_min = -64;
@@ -340,6 +346,7 @@ __device__ __forceinline__ void fused_sparse_v34_row(
     const uint64_t (&xt)[CPT], const bool (&input_active)[CPT],
     const bool (&output_active)[CPT], int32_t (&square_score)[CPT],
     int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    int32_t search_center_x, int32_t search_center_z,
     int32_t base_x, int32_t slab_base_z, int32_t x_base,
     ExtChunkResult* d_results, int32_t max_gpu_buffer,
     uint32_t& thread_found_count, uint32_t* d_emitted_count
@@ -378,9 +385,9 @@ __device__ __forceinline__ void fused_sparse_v34_row(
         if (EMIT && square >= min_size && (NO_UPPER || square <= max_size + 68)) {
             const int32_t cx = base_x + x_base + (int32_t)threadIdx.x + k * TPB;
             const int32_t cz = slab_base_z + z_base + (r - 16);
-            const int64_t cx64 = (int64_t)cx;
-            const int64_t cz64 = (int64_t)cz;
-            if (rd_min_sq != 0 && cx64 * cx64 + cz64 * cz64 < rd_min_sq)
+            const int64_t dx64 = (int64_t)cx - (int64_t)search_center_x;
+            const int64_t dz64 = (int64_t)cz - (int64_t)search_center_z;
+            if (rd_min_sq != 0 && dx64 * dx64 + dz64 * dz64 < rd_min_sq)
                 continue;
             const int32_t exact = circle_from_shared_ring<STRIDE, NO_UPPER>(
                 rows, r, word, lane, square, min_size, max_size);
@@ -412,6 +419,7 @@ template <int TPB, int CPT, int BAND_H, bool DENSE_COUNT, int RNG_MODE, bool NO_
 __global__ __launch_bounds__(TPB) void search_slime_fused_sparse_v34_kernel(
     const uint64_t* __restrict__ x_terms,
     const uint64_t* __restrict__ seeded_z_terms,
+    int32_t search_center_x, int32_t search_center_z,
     int32_t base_x, int32_t slab_base_z,
     int32_t out_width, int32_t out_height,
     int32_t tiles_x, int32_t tiles_z,
@@ -466,36 +474,42 @@ __global__ __launch_bounds__(TPB) void search_slime_fused_sparse_v34_kernel(
                 fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,true,NO_UPPER>(
                     rows, seeded_z_terms, z_base, r, lane, warp,
                     xt, input_active, output_active, square_score,
-                    min_size, max_size, emit_min_size, rd_min_sq, base_x, slab_base_z, x_base,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base,
                     d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
             fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,true,NO_UPPER>(
                 rows, seeded_z_terms, z_base, 16, lane, warp,
                 xt, input_active, output_active, square_score,
-                min_size, max_size, emit_min_size, rd_min_sq, base_x, slab_base_z, x_base,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base,
                 d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
             for (int32_t r = 17; r < tile_in_h; ++r)
                 fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,true,NO_UPPER>(
                     rows, seeded_z_terms, z_base, r, lane, warp,
                     xt, input_active, output_active, square_score,
-                    min_size, max_size, emit_min_size, rd_min_sq, base_x, slab_base_z, x_base,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base,
                     d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
         } else {
             for (int32_t r = 0; r < 16; ++r)
                 fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,false,NO_UPPER>(
                     rows, seeded_z_terms, z_base, r, lane, warp,
                     xt, input_active, output_active, square_score,
-                    min_size, max_size, emit_min_size, rd_min_sq, base_x, slab_base_z, x_base,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base,
                     d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
             fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,false,NO_UPPER>(
                 rows, seeded_z_terms, z_base, 16, lane, warp,
                 xt, input_active, output_active, square_score,
-                min_size, max_size, emit_min_size, rd_min_sq, base_x, slab_base_z, x_base,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base,
                 d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
             for (int32_t r = 17; r < tile_in_h; ++r)
                 fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,false,NO_UPPER>(
                     rows, seeded_z_terms, z_base, r, lane, warp,
                     xt, input_active, output_active, square_score,
-                    min_size, max_size, emit_min_size, rd_min_sq, base_x, slab_base_z, x_base,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base,
                     d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
         }
         __syncthreads();
@@ -841,6 +855,22 @@ extern "C" {
         return count;
     }
 
+    __declspec(dllexport) int32_t get_cuda_device_name(char* buffer, int32_t buffer_size) {
+        if (!buffer || buffer_size <= 1) return 0;
+        int device = 0;
+        cudaDeviceProp prop{};
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+            cudaGetLastError();
+            buffer[0] = '\0';
+            return 0;
+        }
+        const size_t n = std::min((size_t)buffer_size - 1U, std::strlen(prop.name));
+        std::memcpy(buffer, prop.name, n);
+        buffer[n] = '\0';
+        return (int32_t)n;
+    }
+
 
     __declspec(dllexport) int32_t get_gpu_v34_shape() {
         return g_v34_last_shape;
@@ -856,15 +886,35 @@ extern "C" {
 
     __declspec(dllexport) void request_cancel() {
         g_cancel_requested = 1;
+        g_pause_requested = 0;
+    }
+
+    __declspec(dllexport) void request_pause() {
+        g_pause_requested = 1;
+    }
+
+    __declspec(dllexport) void resume_search() {
+        g_pause_requested = 0;
     }
 
     __declspec(dllexport) void reset_cancel() {
         g_cancel_requested = 0;
+        g_pause_requested = 0;
         g_progress = 0;
+        g_processed_centers.store(0, std::memory_order_relaxed);
+        g_gpu_scan_work_ns.store(0, std::memory_order_relaxed);
     }
 
     __declspec(dllexport) int32_t get_progress() {
         return g_progress;
+    }
+
+    __declspec(dllexport) int64_t get_processed_centers() {
+        return g_processed_centers.load(std::memory_order_relaxed);
+    }
+
+    __declspec(dllexport) int64_t get_gpu_scan_work_ns() {
+        return g_gpu_scan_work_ns.load(std::memory_order_relaxed);
     }
 
     __declspec(dllexport) void cleanup_gpu_resources() {
@@ -905,28 +955,34 @@ extern "C" {
 
     static int64_t search_slime_clusters_gpu_v34_impl(
         int64_t seed, int64_t rd_max, int32_t min_size, int32_t max_size, int64_t rd_min,
+        int32_t search_center_x, int32_t search_center_z,
         ExtChunkResult* results_buffer, int32_t max_results, int32_t precise_afk
     ) {
         // V34 is the only scan implementation. Return -1 on invalid input or a
         // CUDA failure; the Python layer reports the failure without fallback.
         if (!results_buffer || max_results <= 0 || rd_max < 0 ||
             rd_max > (INT32_MAX - 17LL) / 2LL || min_size < 0) return -1;
+        if ((int64_t)search_center_x - rd_max - 8LL < INT32_MIN ||
+            (int64_t)search_center_x + rd_max + 8LL > INT32_MAX ||
+            (int64_t)search_center_z - rd_max - 8LL < INT32_MIN ||
+            (int64_t)search_center_z + rd_max + 8LL > INT32_MAX) return -1;
         if (!g_gpu_y_tables_ready) rebuild_gpu_y_tables();
         g_progress = 1;
 
         const int32_t width = (int32_t)(rd_max * 2 + 1);
         const int32_t height = width;
-        const int32_t base_x = (int32_t)-rd_max;
-        const int32_t base_z = (int32_t)-rd_max;
+        const int32_t base_x = (int32_t)((int64_t)search_center_x - rd_max);
+        const int32_t base_z = (int32_t)((int64_t)search_center_z - rd_max);
         const int64_t rd_min_sq = rd_min * rd_min;
         const size_t term_count = (size_t)width + 16U;
 
         std::vector<uint64_t> h_x_terms(term_count);
         std::vector<uint64_t> h_z_terms(term_count);
         for (size_t i = 0; i < term_count; ++i) {
-            int32_t coordinate = (int32_t)((int64_t)base_x - 8LL + (int64_t)i);
-            h_x_terms[i] = calc_x_part((uint32_t)coordinate);
-            h_z_terms[i] = calc_z_part((uint32_t)coordinate) + (uint64_t)seed;
+            const int32_t coordinate_x = (int32_t)((int64_t)base_x - 8LL + (int64_t)i);
+            const int32_t coordinate_z = (int32_t)((int64_t)base_z - 8LL + (int64_t)i);
+            h_x_terms[i] = calc_x_part((uint32_t)coordinate_x);
+            h_z_terms[i] = calc_z_part((uint32_t)coordinate_z) + (uint64_t)seed;
         }
 
         const int32_t hard_buffer_cap = std::max(1500000, max_results);
@@ -1008,12 +1064,14 @@ extern "C" {
                 if (emit_min_size > min_size) \
                     search_slime_fused_sparse_v34_kernel<T, C, BAND_H, true, R, N><<<launch_blocks, T>>>( \
                         d_x_terms, d_z_terms + launch_z_offset, \
+                        search_center_x, search_center_z, \
                         base_x, base_z + launch_z_offset, launch_width, launch_height, \
                         launch_tiles_x, launch_tiles_z, min_size, max_size, emit_min_size, rd_min_sq, \
                         d_results, gpu_buffer_cap, d_found_count, d_emitted_count); \
                 else \
                     search_slime_fused_sparse_v34_kernel<T, C, BAND_H, false, R, N><<<launch_blocks, T>>>( \
                         d_x_terms, d_z_terms + launch_z_offset, \
+                        search_center_x, search_center_z, \
                         base_x, base_z + launch_z_offset, launch_width, launch_height, \
                         launch_tiles_x, launch_tiles_z, min_size, max_size, emit_min_size, rd_min_sq, \
                         d_results, gpu_buffer_cap, d_found_count, d_emitted_count); \
@@ -1274,6 +1332,8 @@ extern "C" {
             for (auto& bucket : score_buckets) bucket.clear();
 
             for (int32_t z_offset = 0; z_offset < height;) {
+                while (g_pause_requested && !g_cancel_requested)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 if (g_cancel_requested) break;
                 int32_t out_height = std::min(slab_height, height - z_offset);
                 if (cudaMemset(d_found_count, 0, sizeof(uint32_t)) != cudaSuccess ||
@@ -1285,13 +1345,18 @@ extern "C" {
                 int64_t total_tiles = (int64_t)tiles_x * tiles_z;
                 int32_t blocks = (int32_t)std::min<int64_t>(8192, total_tiles);
                 cudaError_t launch_status = cudaSuccess;
+                const auto scan_begin = std::chrono::steady_clock::now();
                 launch_status = launch_v34(v34_shape, v34_rng, z_offset, width, out_height,
                                            tiles_x, tiles_z, blocks, emit_min_size);
                 cudaError_t sync_status = cudaDeviceSynchronize();
+                const auto scan_end = std::chrono::steady_clock::now();
                 if (launch_status != cudaSuccess || sync_status != cudaSuccess) {
                     failed = true;
                     break;
                 }
+                const int64_t scan_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(scan_end - scan_begin).count();
+                g_processed_centers.fetch_add((int64_t)out_height * (int64_t)width, std::memory_order_relaxed);
+                g_gpu_scan_work_ns.fetch_add(std::max<int64_t>(1, scan_ns), std::memory_order_relaxed);
                 uint32_t slab_found_count = 0;
                 uint32_t slab_stored_count = 0;
                 if (cudaMemcpy(&slab_stored_count, d_emitted_count, sizeof(uint32_t),
@@ -1432,7 +1497,17 @@ extern "C" {
         ExtChunkResult* results_buffer, int32_t max_results, int32_t precise_afk
     ) {
         return search_slime_clusters_gpu_v34_impl(
-            seed, rd_max, min_size, max_size, rd_min,
+            seed, rd_max, min_size, max_size, rd_min, 0, 0,
+            results_buffer, max_results, precise_afk);
+    }
+
+    __declspec(dllexport) int64_t search_slime_clusters_gpu_v34_centered(
+        int64_t seed, int64_t rd_max, int32_t min_size, int32_t max_size, int64_t rd_min,
+        int32_t search_center_x, int32_t search_center_z,
+        ExtChunkResult* results_buffer, int32_t max_results, int32_t precise_afk
+    ) {
+        return search_slime_clusters_gpu_v34_impl(
+            seed, rd_max, min_size, max_size, rd_min, search_center_x, search_center_z,
             results_buffer, max_results, precise_afk);
     }
 
