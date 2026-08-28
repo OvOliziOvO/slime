@@ -41,7 +41,7 @@ $env:SLIME_GPU_V1_RNG = "native"
 
 | Minecraft 支持范围 | 下载 |
 |---|---|
-| 1.19 ～ 26.2 | [cubiomes_latest_26.2.zip](downloads/cubiomes_latest_26.2.zip) |
+| 1.19 ～ 26.2 | [cubiomes_latest_26.2.zip](https://github.com/OvOliziOvO/slime/releases/latest/download/cubiomes_latest_26.2.zip) |
 
 下载后解压，把 `cubiomes.dll` 放到 EXE 或 `SlimeFinder.py` 同目录。ZIP 内附 cubiomes 的 MIT License。当前新版 DLL 只依赖 Windows 系统库，不需要额外的 `libwinpthread-1.dll`。
 

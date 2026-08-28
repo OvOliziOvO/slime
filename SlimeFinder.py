@@ -35,7 +35,7 @@ SUPPORTED_MC_VERSIONS = (
     "1.21.5", "1.21.6", "1.21.9", "1.21.11", "26.1", "26.2",
 )
 CUBIOMES_GENERATOR_BUFFER_SIZE = 256 * 1024
-CUBIOMES_DOWNLOAD_URL = "https://github.com/OvOliziOvO/slime/raw/refs/heads/main/downloads/cubiomes_latest_26.2.zip"
+CUBIOMES_DOWNLOAD_URL = "https://github.com/OvOliziOvO/slime/releases/latest/download/cubiomes_latest_26.2.zip"
 Y_PACK_SHIFT = 20
 Y_PACK_MASK = (1 << Y_PACK_SHIFT) - 1
 Y_PACK_BIAS = 1024
