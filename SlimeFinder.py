@@ -35,7 +35,8 @@ SUPPORTED_MC_VERSIONS = (
     "1.21.5", "1.21.6", "1.21.9", "1.21.11", "26.1", "26.2",
 )
 CUBIOMES_GENERATOR_BUFFER_SIZE = 256 * 1024
-CUBIOMES_DOWNLOAD_URL = "https://github.com/Conflux-Union/cubiomes"
+CUBIOMES_LEGACY_DOWNLOAD_URL = "https://github.com/OvOliziOvO/slime/raw/refs/heads/main/downloads/cubiomes_legacy_1.21.4.zip"
+CUBIOMES_LATEST_DOWNLOAD_URL = "https://github.com/OvOliziOvO/slime/raw/refs/heads/main/downloads/cubiomes_latest_26.2.zip"
 Y_PACK_SHIFT = 20
 Y_PACK_MASK = (1 << Y_PACK_SHIFT) - 1
 Y_PACK_BIAS = 1024
@@ -3079,17 +3080,21 @@ class SlimeApp(QWidget):
 
         self.chk_dd = QCheckBox(" 检测是否有深谙之域")
         self.chk_dd.setChecked(bool(cb))
-        self.cubiomes_download_btn = QPushButton("下载噪声检查组件")
-        self.cubiomes_download_btn.setToolTip("打开 cubiomes 上游源码页面；组件保持外置，不打包进本程序 EXE。")
-        self.cubiomes_download_btn.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl(CUBIOMES_DOWNLOAD_URL)))
-        self.cubiomes_download_btn.setVisible(not bool(cb))
+        self.cubiomes_legacy_btn = QPushButton("旧版噪声组件 · 支持至 1.21.4")
+        self.cubiomes_latest_btn = QPushButton("新版噪声组件 · 支持至 26.2")
+        self.cubiomes_legacy_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(CUBIOMES_LEGACY_DOWNLOAD_URL)))
+        self.cubiomes_latest_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(CUBIOMES_LATEST_DOWNLOAD_URL)))
+        self.cubiomes_legacy_btn.setVisible(not bool(cb))
+        self.cubiomes_latest_btn.setVisible(not bool(cb))
         if not cb:
             self.chk_dd.setEnabled(False)
             self.chk_dd.setText("噪声/群系检查未安装")
-            self.chk_dd.setToolTip(DLL_ERROR_MSG + "\n下载/源码：" + CUBIOMES_DOWNLOAD_URL)
+            self.chk_dd.setToolTip(DLL_ERROR_MSG + "\n下载 ZIP，解压 cubiomes.dll 到程序目录。")
         left_v.addWidget(self.chk_dd)
-        left_v.addWidget(self.cubiomes_download_btn)
+        left_v.addWidget(self.cubiomes_legacy_btn)
+        left_v.addWidget(self.cubiomes_latest_btn)
 
         self.chk_precise_afk = QCheckBox(" 精准挂机点")
         self.chk_precise_afk.setChecked(self.config.precise_afk)
