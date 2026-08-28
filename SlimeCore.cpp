@@ -5,6 +5,7 @@
 #include <queue>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <immintrin.h>
@@ -67,6 +68,25 @@ inline bool slime_from_first_lcg(uint64_t rnd) {
 }
 
 #if defined(__AVX2__) || (defined(_MSC_VER) && defined(_M_AVX2))
+static constexpr uint64_t PREFIX4_LUT[16] = {
+    0x0000000000000000ULL, 0x0001000100010001ULL,
+    0x0001000100010000ULL, 0x0002000200020001ULL,
+    0x0001000100000000ULL, 0x0002000200010001ULL,
+    0x0002000200010000ULL, 0x0003000300020001ULL,
+    0x0001000000000000ULL, 0x0002000100010001ULL,
+    0x0002000100010000ULL, 0x0003000200020001ULL,
+    0x0002000100000000ULL, 0x0003000200010001ULL,
+    0x0003000200010000ULL, 0x0004000300020001ULL,
+};
+
+inline void append_prefix4(short* dst, short& row_sum, int32_t mask) {
+    const uint64_t inc = PREFIX4_LUT[mask & 15];
+    const uint64_t base = (uint64_t)(uint16_t)row_sum * 0x0001000100010001ULL;
+    const uint64_t packed = base + inc;
+    std::memcpy(dst, &packed, sizeof(packed));
+    row_sum += (short)(inc >> 48);
+}
+
 inline __m256i lcg_first4(__m256i state) {
     // Low 64 bits of a 64x64 multiply by the 35-bit Java LCG constant,
     // assembled from AVX2's four parallel 32x32->64 multiplies.
@@ -403,24 +423,16 @@ extern "C" {
                         __m256i rnd_b = lcg_first4(_mm256_xor_si256(_mm256_add_epi64(vx, z4b), scramble));
                         int32_t slime_mask_a = slime_mask4_from_lcg(rnd_a);
                         int32_t slime_mask_b = slime_mask4_from_lcg(rnd_b);
-                        for (int32_t lane = 0; lane < 4; ++lane) {
-                            row_sum += (short)((slime_mask_a >> lane) & 1);
-                            z_prefix[i * H + j + lane] = row_sum;
-                        }
-                        for (int32_t lane = 0; lane < 4; ++lane) {
-                            row_sum += (short)((slime_mask_b >> lane) & 1);
-                            z_prefix[i * H + j + 4 + lane] = row_sum;
-                        }
+                        short* out = z_prefix.data() + i * H + j;
+                        append_prefix4(out, row_sum, slime_mask_a);
+                        append_prefix4(out + 4, row_sum, slime_mask_b);
                     }
                     for (; j + 4 <= H; j += 4) {
                         __m256i z4 = _mm256_loadu_si256((const __m256i*)(z_components.data() + j));
                         __m256i states = _mm256_xor_si256(_mm256_add_epi64(vx, z4), scramble);
                         __m256i rnd = lcg_first4(states);
                         int32_t slime_mask = slime_mask4_from_lcg(rnd);
-                        for (int32_t lane = 0; lane < 4; ++lane) {
-                            row_sum += (short)((slime_mask >> lane) & 1);
-                            z_prefix[i * H + j + lane] = row_sum;
-                        }
+                        append_prefix4(z_prefix.data() + i * H + j, row_sum, slime_mask);
                     }
 #endif
                     for (; j < H; ++j) {

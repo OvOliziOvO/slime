@@ -7,85 +7,32 @@ import glob
 import gc
 import json
 import ctypes
-import copy
 import re
-import zipfile
 import math
-from io import BytesIO
-import urllib.request
-import urllib.error
-import ssl
 import atexit
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PyQt6.QtWidgets import *
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QEvent, QTimer, QThread, QSize, QPropertyAnimation, QPointF
-from PyQt6.QtGui import QPixmap, QPixmapCache, QKeySequence, QShortcut, QImage, QPainter, QColor, QPen, QCursor, QAction, QIcon, QPainterPath, QPolygonF
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QSize, QPropertyAnimation, QPointF
+from PyQt6.QtGui import QPixmap, QPixmapCache, QKeySequence, QShortcut, QImage, QPainter, QColor, QPen, QAction, QIcon, QPainterPath, QPolygonF
 
 try:
-    from litemapy import Schematic, Region, BlockState, TileEntity, Entity
-    import nbtlib
-    from nbtlib.tag import Int, List, Compound
+    from litemapy import Schematic, Region, BlockState
     HAS_LITEMAPY = True
 except ImportError:
     # Keep the app importable so export_proj() can show its friendly warning.
     HAS_LITEMAPY = False
-    Schematic = BlockState = TileEntity = Entity = None
-    nbtlib = None
+    Schematic = BlockState = None
     Region = object
-    Int = int
-    List = list
-    Compound = dict
-
-class Myreg(Region):
-    __entities: list
-    __tile_entities: list
-
-    def __init__(self, x, y, z, width, height, length):
-        self.__x = x
-        self.__y = y
-        self.__z = z
-        super().__init__(0, 0, 0, width, height, length)
-        self.__entities = []
-        self.__tile_entities = []
-
-    @property
-    def x(self) -> int: return self.__x
-    @x.setter
-    def x(self, value): self.__x = value
-    @property
-    def y(self) -> int: return self.__y
-    @y.setter
-    def y(self, value): self.__y = value
-    @property
-    def z(self) -> int: return self.__z
-    @z.setter
-    def z(self, value): self.__z = value
-    @property
-    def entities(self) -> list: return self.__entities
-    @entities.setter
-    def entities(self, value): self.__entities = value
-    @property
-    def tile_entities(self) -> list: return self.__tile_entities
-    @tile_entities.setter
-    def tile_entities(self, value): self.__tile_entities = value
-
-    def to_nbt(self) -> Compound:
-        root = super().to_nbt()
-        root["Position"]["x"] = Int(self.x)
-        root["Position"]["y"] = Int(self.y)
-        root["Position"]["z"] = Int(self.z)
-        root["Entities"] = List[Compound]([entity.to_nbt() for entity in self.entities])
-        root["TileEntities"] = List[Compound]([te.to_nbt() for te in self.tile_entities])
-        return root
 
 FILTER_MUSHROOM_ISLAND = True
 APP_VERSION = "V1"
 Y_PACK_SHIFT = 20
 Y_PACK_MASK = (1 << Y_PACK_SHIFT) - 1
 Y_PACK_BIAS = 1024
-TOP_RESULT_LIMIT = 50
-MAX_LITEMATIC_BYTES = 128 * 1024 * 1024
+DEFAULT_RESULT_LIMIT = 50
+MAX_RESULT_LIMIT = 1000
+TOP_RESULT_LIMIT = DEFAULT_RESULT_LIMIT  # legacy fallback for old settings/history
 SPAWN_INNER_RADIUS = 24
 SPAWN_OUTER_RADIUS = 128
 SPAWN_INNER_SQ = SPAWN_INNER_RADIUS * SPAWN_INNER_RADIUS
@@ -250,25 +197,6 @@ def create_slime_floor_schematic(
                 floor[(x, 0, z)] = floor_block
     return schem
 
-def clone_litematic_region(src, dx=0, dy=0, dz=0):
-    """Clone a litematic region without losing local entities or signed sizes."""
-    nr = Region(src.x + dx, src.y + dy, src.z + dz,
-                src.width, src.height, src.length)
-    def local_indices(size):
-        # Public Region coordinates run -(N-1)..0 for a negative dimension.
-        return range(size + 1, 1) if size < 0 else range(size)
-    for rx in local_indices(src.width):
-        for ry in local_indices(src.height):
-            for rz in local_indices(src.length):
-                nr[rx, ry, rz] = src[rx, ry, rz]
-    # Entity positions are local to their region. Shifting the region origin is
-    # sufficient; changing Pos here would apply the offset twice.
-    nr.tile_entities.extend(copy.deepcopy(src.tile_entities))
-    nr.entities.extend(copy.deepcopy(src.entities))
-    nr.block_ticks.extend(copy.deepcopy(src.block_ticks))
-    nr.fluid_ticks.extend(copy.deepcopy(src.fluid_ticks))
-    return nr
-
 # Chunks that may contribute spawning spaces around a candidate AFK point.
 # Precompute per-block-local-position overlap counts so precise comparison does
 # ~200 chunk checks per candidate instead of ~49,640 block checks.
@@ -356,7 +284,10 @@ def format_elapsed(seconds):
     return f"{m:d}分{s:02d}秒"
 
 def precise_eval_target_pool(has_biome_filter=False, config=None):
-    default_pool = TOP_RESULT_LIMIT * (40 if has_biome_filter else 4)
+    result_limit = clamp_int(
+        getattr(config, "result_limit", DEFAULT_RESULT_LIMIT) if config is not None else DEFAULT_RESULT_LIMIT,
+        DEFAULT_RESULT_LIMIT, 1, MAX_RESULT_LIMIT)
+    default_pool = result_limit * (40 if has_biome_filter else 4)
     configured = getattr(config, "precise_target_pool", 0) if config is not None else 0
     if configured:
         value = configured
@@ -365,7 +296,7 @@ def precise_eval_target_pool(has_biome_filter=False, config=None):
             value = int(os.environ.get("SLIME_PRECISE_TARGET_POOL", str(default_pool)))
         except Exception:
             value = default_pool
-    return max(TOP_RESULT_LIMIT, min(int(value), 20000))
+    return max(result_limit, min(int(value), 20000))
 
 def precise_exhaustive_enabled(config=None):
     if bool(getattr(config, "precise_exhaustive", False)):
@@ -667,6 +598,9 @@ def load_native_library(path):
 
     raise OSError(_format_native_load_error(path, errors))
 
+class CubiomesPos(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_int32), ("z", ctypes.c_int32)]
+
 DLL_PATH = find_resource("cubiomes.dll")
 cb = None
 DLL_ERROR_MSG = ""
@@ -679,6 +613,9 @@ else:
         cb.applySeed.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64]
         cb.getBiomeAt.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         cb.getBiomeAt.restype = ctypes.c_int
+        if hasattr(cb, "getSpawn"):
+            cb.getSpawn.argtypes = [ctypes.c_void_p]
+            cb.getSpawn.restype = CubiomesPos
     except Exception as e:
         DLL_ERROR_MSG = f"加载失败: {DLL_PATH}\n{type(e).__name__}: {e}"
         cb = None
@@ -893,6 +830,27 @@ def get_local_generator(seed):
         except Exception: return None
     cb.applySeed(thread_local.buf, 0, ctypes.c_uint64(normalize_java_seed(seed) & 0xFFFFFFFFFFFFFFFF))
     return thread_local.buf
+
+_spawn_position_cache = {}
+def get_world_spawn(seed):
+    seed_i64 = normalize_java_seed(seed)
+    cached = _spawn_position_cache.get(seed_i64)
+    if cached is not None:
+        return cached
+    result = (0, 0)
+    try:
+        if cb and hasattr(cb, "getSpawn"):
+            gen = get_local_generator(seed_i64)
+            if gen is not None:
+                pos = cb.getSpawn(gen)
+                result = (int(pos.x), int(pos.z))
+    except Exception:
+        result = (0, 0)
+    _spawn_position_cache[seed_i64] = result
+    if len(_spawn_position_cache) > 4096:
+        _spawn_position_cache.clear()
+        _spawn_position_cache[seed_i64] = result
+    return result
 
 def is_slime_chunk(seed, chunk_x, chunk_z):
     if is_slime_chunk_fast: return is_slime_chunk_fast(normalize_java_seed(seed), chunk_x, chunk_z)
@@ -1135,6 +1093,7 @@ def run_cpu_scan(seed, rd_max, min_size, max_size, rd_min, buf_size, threads, pr
 def search_slime_clusters_py(seed, rd_max, min_size, max_size, rd_min, buf_size, c_obj=None, is_precise=True):
     import heapq
     rd_min_sq = float(rd_min * rd_min)
+    spawn_x, spawn_z = get_world_spawn(seed)
     total_rows = 2 * rd_max + 1
     leaderboard = []
     max_keep = min(buf_size, 1000000 if is_precise else 500000)
@@ -1160,17 +1119,21 @@ def search_slime_clusters_py(seed, rd_max, min_size, max_size, rd_min, buf_size,
                     # 直接计算刷怪格数，再只保留当前最优池。否则会先按规模截断，漏掉低规模但高刷怪格数的候选。
                     obs = calc_spawnable_spaces(seed, bx, bz)
                     item = (count, bx, bz, bx // 16, bz // 16, seed, obs, None)
-                    key = (obs, count, -abs(bx), -abs(bz), -bx, -bz, seed)
+                    dx_spawn, dz_spawn = bx - spawn_x, bz - spawn_z
+                    dist_sq = dx_spawn * dx_spawn + dz_spawn * dz_spawn
+                    key = (obs, count, -dist_sq, -bx, -bz, seed)
                 else:
                     item = (count, bx, bz, bx // 16, bz // 16, seed, 0, None)
-                    key = (count, -abs(bx), -abs(bz), -bx, -bz, seed)
+                    dx_spawn, dz_spawn = bx - spawn_x, bz - spawn_z
+                    dist_sq = dx_spawn * dx_spawn + dz_spawn * dz_spawn
+                    key = (count, -dist_sq, -bx, -bz, seed)
                 push_candidate(key, item)
 
     final_res = [item for _key, item in leaderboard]
     if is_precise:
-        final_res.sort(key=lambda x: (x[6], x[0], -abs(x[1]), -abs(x[2]), -x[1], -x[2], x[5]), reverse=True)
+        final_res.sort(key=lambda x: (x[6], x[0], -((x[1] - spawn_x) ** 2 + (x[2] - spawn_z) ** 2), -x[1], -x[2], x[5]), reverse=True)
     else:
-        final_res.sort(key=lambda x: (x[0], -abs(x[1]), -abs(x[2]), -x[1], -x[2], x[5]), reverse=True)
+        final_res.sort(key=lambda x: (x[0], -((x[1] - spawn_x) ** 2 + (x[2] - spawn_z) ** 2), -x[1], -x[2], x[5]), reverse=True)
     return final_res, absolute_total
 
 def check_deep_dark_fast(buf, center_chunk_x, center_chunk_z, seed):
@@ -1248,6 +1211,10 @@ class Config:
                         self.selected_engine = "Auto"
                     self.precise_afk = data.get('precise_afk', True)
                     self.scan_y = data.get('scan_y', False)
+                    self.result_limit = clamp_int(data.get('result_limit', DEFAULT_RESULT_LIMIT), DEFAULT_RESULT_LIMIT, 1, MAX_RESULT_LIMIT)
+                    self.theme = str(data.get('theme', 'dark')).lower()
+                    if self.theme not in ('dark', 'light'):
+                        self.theme = 'dark'
                     self.candidate_buffer = clamp_int(data.get('candidate_buffer', 1000000), 1000000, 1000, 3000000)
                     # 0 means auto: no-biome filter keeps Top 200, biome filter keeps Top 2000.
                     self.precise_target_pool = clamp_int(data.get('precise_target_pool', 0), 0, 0, 20000)
@@ -1260,6 +1227,8 @@ class Config:
         self.last_seed, self.last_radius, self.min_search_radius = '', '512', 0
         self.threads = max(1, int(self.max_sys_threads * 0.8))
         self.selected_engine, self.precise_afk, self.scan_y = "Auto", True, False
+        self.result_limit = DEFAULT_RESULT_LIMIT
+        self.theme = 'dark'
         self.candidate_buffer = 1000000
         self.precise_target_pool = 0
         self.native_score_chunk = 8192
@@ -1275,6 +1244,8 @@ class Config:
                     'selected_engine': getattr(self, 'selected_engine', "Auto"),
                     'precise_afk': getattr(self, 'precise_afk', True),
                     'scan_y': getattr(self, 'scan_y', False),
+                    'result_limit': clamp_int(getattr(self, 'result_limit', DEFAULT_RESULT_LIMIT), DEFAULT_RESULT_LIMIT, 1, MAX_RESULT_LIMIT),
+                    'theme': getattr(self, 'theme', 'dark'),
                     'candidate_buffer': getattr(self, 'candidate_buffer', 1000000),
                     'precise_target_pool': getattr(self, 'precise_target_pool', 0),
                     'native_score_chunk': getattr(self, 'native_score_chunk', 8192),
@@ -1284,23 +1255,32 @@ class Config:
 
 class C(QObject):
     l = pyqtSignal(str); i = pyqtSignal(str); p = pyqtSignal(int); t = pyqtSignal(str); info = pyqtSignal(str)
-    btn_state = pyqtSignal(bool); schem_loaded = pyqtSignal(bool, object, str)
-    render_done = pyqtSignal(object, object); search_done = pyqtSignal(object); manual_done = pyqtSignal(object)
+    btn_state = pyqtSignal(bool); search_done = pyqtSignal(object); manual_done = pyqtSignal(object)
     msg_box = pyqtSignal(str, str, str)
     widget_enabled = pyqtSignal(object, bool)
     widget_text = pyqtSignal(object, str)
     native_scan_state = pyqtSignal(bool, str, float, float, int, object)
     cancel = False
 
-def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choice, is_precise, scan_y, is_dd_checked=None):
+def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choice, is_precise, scan_y, result_limit=DEFAULT_RESULT_LIMIT, is_dd_checked=None):
+    result_limit = max(1, min(MAX_RESULT_LIMIT, int(result_limit or DEFAULT_RESULT_LIMIT)))
     def emit_progress(value):
         try:
             app.c.p.emit(max(0, min(100, int(value))))
         except Exception:
             pass
 
+    def _spawn_distance_sq(item):
+        x = int(item[1])
+        z = int(item[2])
+        sx, sz = get_world_spawn(item[5])
+        dx = x - sx
+        dz = z - sz
+        return dx * dx + dz * dz
+
     def size_key(item):
-        return (item[0], -abs(item[1]), -abs(item[2]), -item[1], -item[2], item[5])
+        # Equal slime size -> nearest to this seed's real world spawn first.
+        return (item[0], -_spawn_distance_sq(item), -item[1], -item[2], item[5])
 
     def candidate_obs_score(item):
         try:
@@ -1309,10 +1289,11 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
             return 0
 
     def ranking_key(item):
-        # 精准挂机点只由 is_precise 控制；扫描Y只负责补挂机高度，不能偷偷改变排序模式。
+        # 精准模式仍优先真实刷怪格数；相同分数和相同史莱姆规模时，
+        # 距离该种子真实世界出生点更近的候选优先。
         obs_score = candidate_obs_score(item)
         score = obs_score if is_precise and obs_score > 0 else item[0]
-        return (score, item[0], -abs(item[1]), -abs(item[2]), -item[1], -item[2], item[5])
+        return (score, item[0], -_spawn_distance_sq(item), -item[1], -item[2], item[5])
 
     def with_obs(item, obs_count):
         afk_y = item[7] if len(item) > 7 else None
@@ -1321,20 +1302,28 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
     def needs_precise_score(item):
         return candidate_obs_score(item) <= 0
 
+    upper_bound_cache = {}
+
     def candidate_upper_key(item):
         try:
-            # 精准挂机点会在 X/Z 方向以 4 格步进微调 (-16..16)。
-            # 上界也必须覆盖这些可能的 local 坐标，否则分支剪枝可能误跳过真正更优的点。
             base_lx = int(item[1]) & 15
             base_lz = int(item[2]) & 15
             slime_count = int(item[0])
-            ub = 0
-            for dx in range(-16, 17, 4):
-                for dz in range(-16, 17, 4):
-                    ub = max(ub, spawnable_upper_bound(((base_lx + dx) & 15, (base_lz + dz) & 15), slime_count))
+            cache_key = (base_lx, base_lz, slime_count)
+            ub = upper_bound_cache.get(cache_key)
+            if ub is None:
+                best = 0
+                for dx in range(-16, 17, 4):
+                    for dz in range(-16, 17, 4):
+                        candidate = spawnable_upper_bound(
+                            ((base_lx + dx) & 15, (base_lz + dz) & 15), slime_count)
+                        if candidate > best:
+                            best = candidate
+                ub = best
+                upper_bound_cache[cache_key] = ub
         except Exception:
             ub = 0
-        return (ub, item[0], -abs(item[1]), -abs(item[2]), -item[1], -item[2], item[5])
+        return (ub, item[0], -_spawn_distance_sq(item), -item[1], -item[2], item[5])
 
     def precise_native_batch_enabled():
         value = os.environ.get("SLIME_PRECISE_NATIVE_BATCH", "1").strip().lower()
@@ -1798,7 +1787,7 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
                 elif FILTER_MUSHROOM_ISLAND:
                     check_msg = "排查蘑菇岛"
 
-                target_valid = TOP_RESULT_LIMIT
+                target_valid = result_limit
                 accepted_this_seed = 0
                 accepted_candidates = []
                 processed = 0
@@ -1878,10 +1867,10 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
                     processed, accepted_this_seed, filtered_this_seed, format_elapsed(time.time() - dd_start_time)))
             else:
                 candidates.sort(key=ranking_key, reverse=True)
-                # The UI/history only consumes the global top TOP_RESULT_LIMIT.
-                # A candidate ranked below TOP_RESULT_LIMIT in its own seed cannot enter the global top list,
-                # because that seed already has TOP_RESULT_LIMIT better-or-equal candidates ahead of it.
-                candidates = candidates[:TOP_RESULT_LIMIT]
+                # Keep only the requested Top-N from each seed. A result below
+                # this rank in its own seed cannot enter the global Top-N because
+                # that seed already has N better-or-equal candidates ahead of it.
+                candidates = candidates[:result_limit]
                 if scan_y:
                     candidates = apply_y_after_selection(sd, candidates, "最终候选")
                     candidates.sort(key=ranking_key, reverse=True)
@@ -1905,7 +1894,7 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
         afk_y = best[7] if len(best) > 7 else None
 
         top_50_results = []
-        for i, item in enumerate(all_results[:TOP_RESULT_LIMIT]):
+        for i, item in enumerate(all_results[:result_limit]):
             _s, _bx, _bz, _cx, _cz, _sd, _obs = item[:7]
             _ay = item[7] if len(item) > 7 else None
             top_50_results.append((i + 1, _sd, _s, _obs, _bx, _bz, _ay))
@@ -1935,6 +1924,7 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
             "engine": str(engine_choice),
             "precise_afk": bool(is_precise),
             "scan_y": bool(scan_y),
+            "result_limit": int(result_limit),
         }
         app.c.search_done.emit({
             "main_pos": (block_x, block_z),
@@ -1947,7 +1937,9 @@ def run_full_logic(app, seeds, rd_max, ms, max_s, use_range, rd_min, engine_choi
             "search_params": search_params,
             "history_timestamp": timestamp,
             "history_image": dest,
-            "top_50_results": top_50_results
+            "ranked_results": top_50_results,
+            "top_50_results": top_50_results,  # compatibility with older UI code
+            "result_limit": int(result_limit)
         })
         app.c.i.emit(dest)
         afk_display = f"({block_x}, {afk_y}, {block_z})" if afk_y is not None else f"({block_x}, {block_z})"
@@ -1981,210 +1973,6 @@ def generate_manual_image(app, seed, block_x, block_z):
         app.c.i.emit(dest)
         app.c.info.emit(f"种子: {seed} | 刷怪格数: {obs_count} | 主世界: ({block_x}, {block_z}) | 地狱: ({nether_x}, {nether_z})")
     except Exception as e: app.c.l.emit(str(e))
-
-class DisableWheelFilter(QObject):
-    def eventFilter(self, obj, event):
-        if event.type() == QEvent.Type.Wheel: return True
-        if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down): return True
-        return super().eventFilter(obj, event)
-
-
-# Online download helpers kept from the V2 sidebar UI.
-ssl_ctx = ssl.create_default_context()
-ssl_ctx.check_hostname = False
-ssl_ctx.verify_mode = ssl.CERT_NONE
-
-CLOUD_ZIP_URL = "https://github.com/liziO-O/Slime-Cloud/releases/download/%E5%B0%81%E9%9D%A2/covers.zip"
-MAX_COVER_ZIP_BYTES = 50 * 1024 * 1024
-MAX_COVER_EXTRACT_BYTES = 80 * 1024 * 1024
-MAX_LITEMATIC_BYTES = 128 * 1024 * 1024
-
-PROXIES = [
-    "",
-    "https://ghp.ci/",
-    "https://mirror.ghproxy.com/",
-    "https://ghproxy.net/",
-    "https://github.moeyy.xyz/"
-]
-
-
-def safe_extract_zip(zip_file, target_dir, valid_exts):
-    target_abs = os.path.abspath(target_dir)
-    total_size = 0
-    for info in zip_file.infolist():
-        filename = info.filename.replace("\\", "/")
-        if filename.startswith("/") or ".." in filename.split("/"):
-            raise ValueError(f"zip 内存在不安全路径: {info.filename}")
-        if info.is_dir() or not filename.lower().endswith(valid_exts):
-            continue
-        total_size += int(info.file_size)
-        if total_size > MAX_COVER_EXTRACT_BYTES:
-            raise ValueError("资源压缩包解压后体积过大，已拒绝。")
-        out_path = os.path.abspath(os.path.join(target_abs, filename))
-        if os.path.commonpath([target_abs, out_path]) != target_abs:
-            raise ValueError(f"zip 文件试图写出缓存目录: {info.filename}")
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        with zip_file.open(info) as src, open(out_path, "wb") as dst:
-            shutil.copyfileobj(src, dst, length=1024 * 256)
-
-
-class ClickableLabel(QLabel):
-    clicked = pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit()
-        super().mousePressEvent(event)
-
-
-class ZipCoverFetchThread(QThread):
-    covers_ready = pyqtSignal(list)
-    status_update = pyqtSignal(str)
-
-    def __init__(self, force_refresh=False):
-        super().__init__()
-        self.force_refresh = force_refresh
-        self.error_details = []
-
-    def run(self):
-        try:
-            cache_dir = os.path.join(APP_DIR, "assets", "covers_cache")
-            os.makedirs(cache_dir, exist_ok=True)
-            valid_exts = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif')
-
-            if not self.force_refresh:
-                cached_files = []
-                for root, _, files in os.walk(cache_dir):
-                    for f in files:
-                        if f.lower().endswith(valid_exts):
-                            cached_files.append(os.path.join(root, f))
-
-                if cached_files:
-                    self.status_update.emit("读取本地缓存...")
-
-                    def n_sort(p):
-                        nums = re.findall(r'\d+', os.path.basename(p))
-                        return int(nums[0]) if nums else 0
-                    cached_files.sort(key=n_sort)
-                    time.sleep(0.1)
-                    self.covers_ready.emit(cached_files)
-                    return
-
-            for f in glob.glob(os.path.join(cache_dir, "*")):
-                try:
-                    if os.path.isfile(f):
-                        os.remove(f)
-                    elif os.path.isdir(f):
-                        shutil.rmtree(f)
-                except BaseException:
-                    pass
-
-            if not CLOUD_ZIP_URL:
-                self.covers_ready.emit([])
-                return
-
-            self.status_update.emit("准备连接服务器...")
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': '*/*'}
-
-            zip_data = bytearray()
-            success = False
-
-            for prefix in PROXIES:
-                if self.isInterruptionRequested():
-                    self.covers_ready.emit([])
-                    return
-                target_url = prefix + CLOUD_ZIP_URL if prefix else CLOUD_ZIP_URL
-                try:
-                    req = urllib.request.Request(target_url, headers=headers)
-                    with urllib.request.urlopen(req, context=ssl_ctx, timeout=12) as response:
-                        if response.status == 200:
-                            first_chunk = response.read(2)
-                            if first_chunk != b'PK':
-                                node = "GitHub" if not prefix else prefix.rstrip("/")
-                                self.error_details.append(
-                                    f"{node}: 返回内容不是有效压缩包文件。")
-                                continue
-
-                            zip_data.extend(first_chunk)
-                            total_size = int(
-                                response.getheader(
-                                    'Content-Length', 0))
-                            if total_size > MAX_COVER_ZIP_BYTES:
-                                node = "GitHub" if not prefix else prefix.rstrip("/")
-                                self.error_details.append(
-                                    f"{node}: 文件体积超过限制。")
-                                zip_data.clear()
-                                continue
-                            downloaded = 2
-
-                            while True:
-                                if self.isInterruptionRequested():
-                                    self.covers_ready.emit([])
-                                    return
-                                chunk = response.read(1024 * 256)
-                                if not chunk:
-                                    break
-                                zip_data.extend(chunk)
-                                downloaded += len(chunk)
-                                if downloaded > MAX_COVER_ZIP_BYTES:
-                                    raise ValueError("下载体积超出限制")
-
-                                if total_size > 0:
-                                    pct = int((downloaded / total_size) * 100)
-                                    self.status_update.emit(f"下载中 {pct}%")
-                                else:
-                                    mb = downloaded / (1024 * 1024)
-                                    self.status_update.emit(f"已下载 {mb:.1f}M")
-
-                            success = True
-                            break
-                except Exception as e:
-                    node = "GitHub" if not prefix else prefix.rstrip("/")
-                    self.error_details.append(f"{node}: {type(e).__name__}: {e}")
-                    continue
-
-            if not success:
-                reason = "\n".join(self.error_details[-5:]) if self.error_details else "所有下载节点均未返回有效资源。"
-                self.covers_ready.emit([
-                    "ERROR: 投影封面下载失败。\n"
-                    "原因：无法从服务器下载资源，请检查网络或代理节点状态。\n"
-                    f"{reason}"
-                ])
-                return
-
-            self.status_update.emit("正在解压...")
-            with zipfile.ZipFile(BytesIO(zip_data)) as z:
-                safe_extract_zip(z, cache_dir, valid_exts)
-            zip_data.clear()
-
-            images = []
-            for root_dir, _, files in os.walk(cache_dir):
-                for f in files:
-                    if f.lower().endswith(valid_exts):
-                        images.append(os.path.join(root_dir, f))
-
-            if not images:
-                self.covers_ready.emit([f"ERROR: 解压成功，但未发现有效图片资源。"])
-                return
-
-            def natural_sort_key(filepath):
-                basename = os.path.basename(filepath)
-                numbers = re.findall(r'\d+', basename)
-                return int(numbers[0]) if numbers else 0
-
-            images.sort(key=natural_sort_key)
-            self.covers_ready.emit(images)
-
-        except Exception as e:
-            self.covers_ready.emit([f"ERROR: 运行崩溃: {e}"])
-
-
 
 _ICON_CACHE = {}
 
@@ -2291,36 +2079,16 @@ class SlimeApp(QWidget):
         self.config = Config()
         self.main_pos = self.nether_pos = self.current_seed = self.current_size = self.current_image = self.current_obs_count = self.current_afk_y = None
         self.current_algorithm = None
-        self.loaded_schem = self.latest_extended_schem = None
-        self.base_len_f = self.cycle_len_f = self.base_len_m = self.cycle_len_m = 0
-        self.actual_fixed_cycles = 0
-        self.actual_moving_cycles = 0
-        self.fixed_remainder = 0
-        self.moving_remainder = 0
-
-        self.fixed_axis_dir = "+X"
-        self.moving_axis_dir = "+Z"
-
-        self.fixed_blind_total = 14
-        self.moving_blind_total = 9
-
-        self._is_rendering = False
-        self.cloud_fetched = False
         self.is_sidebar_expanded = True
-        self.last_downloaded_path = ""
+        self._log_lines = []
 
-        # color_card is the external palette only.
-        # BUD extension preview deliberately uses only this external palette;
-        # if it is missing/empty, unknown blocks render transparent/invisible.
-        # Floor preview uses a separate merged palette: built-in defaults first,
-        # then external color_card overrides them when available.
+        # External palette overrides the built-in floor preview colors when available.
         self.color_card = {}
         self.floor_color_card = {}
         self.color_card_warning = ""
         self._load_color_card()
         self.floor_color_card = self._default_color_card()
         self.floor_color_card.update(self.color_card)
-        self._block_color_cache = {}
         self._floor_block_color_cache = {}
 
         self.initUI()
@@ -2344,8 +2112,6 @@ class SlimeApp(QWidget):
         self._search_soft_ceiling = 34
         self.c.native_scan_state.connect(self._set_native_scan_state)
 
-        self.c.schem_loaded.connect(self._on_schem_loaded)
-        self.c.render_done.connect(self._on_render_done)
         self.c.search_done.connect(self._on_search_done)
         self.c.manual_done.connect(self._on_manual_done)
         self.c.msg_box.connect(self._show_thread_message)
@@ -2357,10 +2123,128 @@ class SlimeApp(QWidget):
         if self.color_card_warning:
             QTimer.singleShot(0, self._report_color_card_warning)
 
+    def _theme_stylesheet(self, theme=None):
+        theme = (theme or getattr(self.config, "theme", "dark")).lower()
+        if theme == "light":
+            bg, panel, field, border = "#f5f5f5", "#ffffff", "#ffffff", "#d9d9d9"
+            text, muted, hover = "#151515", "#6c6c6c", "#eeeeee"
+            sidebar, selected = "#ffffff", "#f0f0f0"
+            accent, accent_hover = "#18864b", "#14723f"
+            log_bg = "#fafafa"
+        else:
+            bg, panel, field, border = "#111111", "#171717", "#202020", "#303030"
+            text, muted, hover = "#f1f1f1", "#9a9a9a", "#292929"
+            sidebar, selected = "#151515", "#242424"
+            accent, accent_hover = "#23965b", "#2aaa68"
+            log_bg = "#121212"
+        return f"""
+            QWidget {{ background: {bg}; color: {text}; font-family: 'Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI'; font-size: 12px; }}
+            QFrame#Sidebar {{ background: {sidebar}; border-right: 1px solid {border}; }}
+            QFrame#SearchPanel, QFrame#ResultPanel {{ background: {panel}; border: 1px solid {border}; border-radius: 8px; }}
+            QLabel#Muted {{ color: {muted}; }}
+            QLabel#Status {{ color: {muted}; padding: 2px 0; }}
+            QLineEdit, QTextEdit, QSpinBox, QComboBox {{ background: {field}; border: 1px solid {border}; border-radius: 5px; padding: 6px 8px; color: {text}; }}
+            QLineEdit:focus, QTextEdit:focus, QSpinBox:focus, QComboBox:focus {{ border-color: {accent}; }}
+            QSpinBox::up-button, QSpinBox::down-button {{ width: 0px; height: 0px; border: none; }}
+            QPushButton {{ background: {field}; border: 1px solid {border}; border-radius: 5px; padding: 7px 10px; color: {text}; }}
+            QPushButton:hover {{ background: {hover}; }}
+            QPushButton:pressed {{ background: {selected}; }}
+            QPushButton:disabled {{ color: {muted}; }}
+            QPushButton#Primary {{ background: {accent}; border-color: {accent}; color: white; font-weight: 600; }}
+            QPushButton#Primary:hover {{ background: {accent_hover}; }}
+            QFrame#Sidebar QPushButton {{ background: transparent; border: none; border-radius: 0; padding: 11px 12px 11px 17px; text-align: left; color: {muted}; }}
+            QFrame#Sidebar QPushButton:hover {{ background: {hover}; color: {text}; }}
+            QFrame#Sidebar QPushButton:checked {{ background: {selected}; color: {text}; font-weight: 600; border-left: 3px solid {accent}; }}
+            QGroupBox {{ border: 1px solid {border}; border-radius: 6px; margin-top: 10px; padding-top: 10px; font-weight: 600; }}
+            QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; }}
+            QProgressBar {{ background: {field}; border: 1px solid {border}; border-radius: 4px; text-align: center; color: {muted}; }}
+            QProgressBar::chunk {{ background: {accent}; border-radius: 3px; }}
+            QScrollArea, QListWidget, QTableWidget {{ background: {panel}; border: 1px solid {border}; border-radius: 6px; }}
+            QHeaderView::section {{ background: {field}; color: {muted}; border: none; border-bottom: 1px solid {border}; padding: 7px; }}
+            QTableWidget {{ gridline-color: {border}; selection-background-color: {selected}; selection-color: {text}; }}
+            QMenu {{ background: {panel}; color: {text}; border: 1px solid {border}; }}
+            QMenu::item {{ padding: 7px 18px; }}
+            QMenu::item:selected {{ background: {hover}; }}
+            QScrollBar:vertical {{ background: transparent; width: 10px; }}
+            QScrollBar::handle:vertical {{ background: {border}; min-height: 24px; border-radius: 5px; }}
+            QDialog QTextEdit#LogView {{ background: {log_bg}; }}
+        """
+
+    def _apply_theme(self):
+        self.setStyleSheet(self._theme_stylesheet())
+
+    def show_log_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("运行日志")
+        dlg.resize(760, 500)
+        dlg.setStyleSheet(self.styleSheet())
+        v = QVBoxLayout(dlg)
+        top = QHBoxLayout()
+        hint = QLabel("详细日志仅用于排查；主界面只显示当前状态。")
+        hint.setObjectName("Muted")
+        clear_btn = QPushButton("清空")
+        top.addWidget(hint)
+        top.addStretch()
+        top.addWidget(clear_btn)
+        v.addLayout(top)
+        view = QTextEdit()
+        view.setObjectName("LogView")
+        view.setReadOnly(True)
+        lines = getattr(self, "_log_lines", [])
+        view.setPlainText("\n".join(lines))
+        view.moveCursor(view.textCursor().MoveOperation.End)
+        v.addWidget(view, 1)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(dlg.accept)
+        v.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignRight)
+
+        def clear_logs():
+            self._log_lines = []
+            view.clear()
+            if hasattr(self, "status_message_label"):
+                self.status_message_label.setText("准备就绪")
+        clear_btn.clicked.connect(clear_logs)
+        dlg.exec()
+
+    def open_manual_verify_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("手动验证坐标")
+        dlg.setFixedSize(400, 250)
+        dlg.setStyleSheet(self.styleSheet())
+        form = QFormLayout(dlg)
+        seed_edit = QLineEdit()
+        x_edit = QLineEdit()
+        z_edit = QLineEdit()
+        seed_edit.setPlaceholderText("世界种子")
+        x_edit.setPlaceholderText("方块 X")
+        z_edit.setPlaceholderText("方块 Z")
+        if self.current_seed is not None:
+            seed_edit.setText(str(self.current_seed))
+        if self.main_pos is not None:
+            x_edit.setText(str(self.main_pos[0]))
+            z_edit.setText(str(self.main_pos[1]))
+        form.addRow("种子", seed_edit)
+        form.addRow("X", x_edit)
+        form.addRow("Z", z_edit)
+        actions = QHBoxLayout()
+        image_btn = QPushButton("生成地图")
+        biome_btn = QPushButton("验证群系")
+        actions.addWidget(image_btn)
+        actions.addWidget(biome_btn)
+        form.addRow("", actions)
+
+        def sync_hidden():
+            self.manual_seed.setText(seed_edit.text())
+            self.manual_x.setText(x_edit.text())
+            self.manual_z.setText(z_edit.text())
+        image_btn.clicked.connect(lambda: (sync_hidden(), self.manual_generate()))
+        biome_btn.clicked.connect(lambda: (sync_hidden(), self.test_dd_manual()))
+        dlg.exec()
+
     def open_settings(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("高级设置")
-        dlg.setFixedSize(460, 520)
+        dlg.setFixedSize(620, 560)
         dlg.setStyleSheet(self.styleSheet())
         v = QVBoxLayout(dlg)
 
@@ -2386,6 +2270,7 @@ class SlimeApp(QWidget):
         thread_spin = QSpinBox()
         thread_spin.setRange(1, self.config.max_sys_threads)
         thread_spin.setValue(self.config.threads)
+        thread_spin.setToolTip("主要影响 CPU 模式、Python 后处理和群系检查的并发；不会让 CUDA 主扫描按这个数字开更多 GPU 线程。")
         row1.addWidget(thread_spin)
         row1.addStretch()
         l2.addLayout(row1)
@@ -2397,37 +2282,46 @@ class SlimeApp(QWidget):
         thread_spin.valueChanged.connect(thread_slider.setValue)
         thread_slider.valueChanged.connect(thread_spin.setValue)
 
-        g3 = QGroupBox("候选与精准比对")
+        g3 = QGroupBox("排名、候选与精准比对")
         form = QFormLayout(g3)
+
+        result_limit_spin = QSpinBox()
+        result_limit_spin.setRange(1, MAX_RESULT_LIMIT)
+        result_limit_spin.setValue(getattr(self.config, "result_limit", DEFAULT_RESULT_LIMIT))
+        result_limit_spin.setToolTip("最终前端保留并显示多少名结果。默认 50；只影响最终 Top-N 数量，不改变 GPU 扫图范围。")
+        form.addRow("最终显示排名数量:", result_limit_spin)
 
         buffer_spin = QSpinBox()
         buffer_spin.setRange(1000, 3000000)
         buffer_spin.setSingleStep(50000)
         buffer_spin.setValue(getattr(self.config, "candidate_buffer", 1000000))
-        buffer_spin.setToolTip("DLL 最多写回多少个候选给 Python。发现总数可以更大，但实际后处理只处理这里保留的候选。")
-        form.addRow("候选缓冲上限:", buffer_spin)
+        buffer_spin.setToolTip("GPU/CPU DLL 最多把多少个候选坐标交给 Python 做后处理。不是扫描上限；扫描仍会完整进行。")
+        form.addRow("最多回传候选数量:", buffer_spin)
 
         pool_spin = QSpinBox()
         pool_spin.setRange(0, 20000)
         pool_spin.setSingleStep(50)
         pool_spin.setValue(getattr(self.config, "precise_target_pool", 0))
         pool_spin.setSpecialValueText("自动")
-        pool_spin.setToolTip("智能精准保留多少个候选进入后续群系过滤/排序。0=自动：普通 200，群系过滤 2000。")
-        form.addRow("智能精准结果池:", pool_spin)
+        pool_spin.setToolTip("精准模式不会把所有候选都算到底，而是先用上界筛选，保留这批最有希望的候选做完整刷怪格数计算。0=自动。")
+        form.addRow("进入完整精准评分的候选数:", pool_spin)
 
         chunk_spin = QSpinBox()
         chunk_spin.setRange(128, 20000)
         chunk_spin.setSingleStep(128)
         chunk_spin.setValue(getattr(self.config, "native_score_chunk", 8192))
-        chunk_spin.setToolTip("每批送给 CPU/GPU DLL 评分的候选数量。大一点通常更快，但取消响应会稍慢。")
-        form.addRow("原生评分批量:", chunk_spin)
+        chunk_spin.setToolTip("一次交给原生 CPU/GPU 评分函数多少个候选。大一点通常吞吐更好，但单批耗时更长、取消响应稍慢。")
+        form.addRow("每批精准评分数量:", chunk_spin)
 
-        exhaustive_cb = QCheckBox("全量精准比对全部保留候选（很慢）")
+        exhaustive_cb = QCheckBox("所有回传候选都做完整精准评分（非常慢）")
         exhaustive_cb.setChecked(getattr(self.config, "precise_exhaustive", False))
-        exhaustive_cb.setToolTip("开启后会对候选缓冲里的所有候选计算刷怪格数。大范围不推荐。")
-        form.addRow("精准模式:", exhaustive_cb)
+        exhaustive_cb.setToolTip("关闭时使用智能上界剪枝；开启后跳过剪枝，对候选缓冲里的全部候选计算刷怪格数。大范围不推荐。")
+        form.addRow("全量精准模式:", exhaustive_cb)
 
-        hint = QLabel("说明：如果扫描发现 300W，但候选缓冲是 100W，后处理只会处理 DLL 写回的 100W；发现总数仍会显示在日志里。")
+        hint = QLabel(
+            "简单理解：GPU先完整扫地图 → 回传一批最好的候选 → 精准模式再从里面挑最有希望的一批算刷怪格数 → 最终只显示Top-N。\n"
+            "正常使用建议：排名50、回传100万、精准候选自动、每批8192、全量精准关闭。"
+        )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #aaa;")
         form.addRow("", hint)
@@ -2449,6 +2343,7 @@ class SlimeApp(QWidget):
             self.config.use_range = cb_range.isChecked()
             self.config.use_min_radius = cb_min_rad.isChecked()
             self.config.threads = thread_spin.value()
+            self.config.result_limit = result_limit_spin.value()
             self.config.candidate_buffer = buffer_spin.value()
             self.config.precise_target_pool = pool_spin.value()
             self.config.native_score_chunk = chunk_spin.value()
@@ -2547,29 +2442,6 @@ class SlimeApp(QWidget):
         cache[key] = color
         return color
 
-    def get_block_color(self, block):
-        """BUD extension preview color.
-
-        This intentionally uses only the external color_card. There is no
-        built-in fallback here: when color_card is missing/empty, BUD preview
-        blocks should be invisible instead of using the floor palette.
-        """
-        try:
-            key = self._normalize_minecraft_block_id(str(block))
-        except Exception:
-            return QColor(0, 0, 0, 0)
-
-        cache = getattr(self, "_block_color_cache", None)
-        if cache is None:
-            self._block_color_cache = cache = {}
-        cached = cache.get(key)
-        if cached is not None:
-            return cached
-
-        color = self._lookup_color_from_palette(self.color_card, key, QColor(0, 0, 0, 0))
-        cache[key] = color
-        return color
-
     def _lookup_color_from_palette(self, palette, block, fallback_color):
         try:
             block = self._normalize_minecraft_block_id(str(block))
@@ -2620,10 +2492,8 @@ class SlimeApp(QWidget):
                 errors.append(str(e))
         if not self.color_card:
             self.color_card_warning = (
-                "未读取到有效的 color_card 色卡文件。\n"
-                "BUD 延长预览将不会使用内置色卡，缺少颜色的方块会直接不可见；\n"
-                "地板生成预览仍会使用内置色卡兜底。\n"
-                "请确认程序目录存在 color_card，且每行格式为：minecraft:block r g b"
+                "未读取到有效的 color_card 色卡文件；地板预览将使用内置色卡。\n"
+                "如需自定义颜色，请确认程序目录存在 color_card，且每行格式为：minecraft:block r g b"
             )
         elif errors:
             self.color_card_warning = "color_card 部分行无法解析，已跳过：" + "；".join(errors[:5])
@@ -2717,13 +2587,198 @@ class SlimeApp(QWidget):
 
     def _on_search_done(self, state):
         self._apply_run_state(state)
-        self.top_50_results = state.get("top_50_results", [])
+        self.top_50_results = state.get("ranked_results", state.get("top_50_results", []))
+        self._refresh_rank_controls()
         if self.current_seed is not None: self.proj_manual_seed.setText(str(self.current_seed))
         if self.main_pos is not None:
             self.proj_manual_x.setText(str(self.main_pos[0]))
             self.proj_manual_z.setText(str(self.main_pos[1]))
         self.trigger_floor_preview_update()
         self._save_search_history(state)
+
+    def _refresh_rank_controls(self):
+        results = list(getattr(self, "top_50_results", []) or [])
+        count = len(results)
+        if not hasattr(self, "rank_select_spin"):
+            return
+        enabled = count > 0
+        self.rank_select_spin.setEnabled(enabled)
+        self.rank_select_spin.setRange(1, max(1, count))
+        if enabled:
+            self.rank_select_spin.setValue(min(max(1, self.rank_select_spin.value()), count))
+            self.result_status_label.setText(f"已保留 {count} 个排名结果 · 当前使用 #1")
+            first = results[0]
+            self._update_rank_detail(first)
+        else:
+            self.rank_select_spin.setValue(1)
+            self.result_status_label.setText("尚未产生排名结果")
+            self.rank_detail_label.setText("搜索完成后，可直接选择第 1～N 名作为当前坐标和地板投影中心。")
+        for name in ("rank_apply_btn", "rank_list_btn", "rank_export_btn"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(enabled)
+        if hasattr(self, "rank_toggle_btn"):
+            self.rank_toggle_btn.setEnabled(enabled)
+
+    def _toggle_rank_panel(self):
+        if not hasattr(self, "rank_panel"):
+            return
+        expanded = not self.rank_panel.isVisible()
+        self.rank_panel.setVisible(expanded)
+        if hasattr(self, "rank_toggle_btn"):
+            self.rank_toggle_btn.setText("收起排名" if expanded else "查看排名")
+
+    def _update_rank_detail(self, entry):
+        if not entry or not hasattr(self, "rank_detail_label"):
+            return
+        rank, seed, size, obs, bx, bz, ay = entry[:7]
+        obs_text = "未计算" if obs is None else str(obs)
+        y_text = "未扫描" if ay is None else str(ay)
+        self.rank_detail_label.setText(
+            f"#{rank} · 种子 {seed} · 规模 {size} · 刷怪格数 {obs_text} · "
+            f"主世界 ({bx}, {y_text}, {bz}) · 地狱 ({bx // 8}, {bz // 8})")
+
+    def preview_ranked_result(self, rank):
+        results = list(getattr(self, "top_50_results", []) or [])
+        if not results:
+            return
+        rank = max(1, min(len(results), int(rank)))
+        self._update_rank_detail(results[rank - 1])
+
+    def _step_rank_result(self, delta):
+        if not getattr(self, "top_50_results", None):
+            return
+        value = max(1, min(self.rank_select_spin.maximum(), self.rank_select_spin.value() + int(delta)))
+        self.rank_select_spin.setValue(value)
+        self.apply_ranked_result()
+
+    def apply_ranked_result(self, rank=None):
+        results = list(getattr(self, "top_50_results", []) or [])
+        if not results:
+            return
+        if rank is None:
+            rank = self.rank_select_spin.value()
+        rank = max(1, min(len(results), int(rank)))
+        self.rank_select_spin.setValue(rank)
+        entry = results[rank - 1]
+        _rank, seed, size, obs, bx, bz, ay = entry[:7]
+        self.current_seed = seed
+        self.current_size = size
+        self.current_obs_count = obs
+        self.current_afk_y = ay
+        self.main_pos = (bx, bz)
+        self.nether_pos = (bx // 8, bz // 8)
+        self.result_status_label.setText(f"已保留 {len(results)} 个排名结果 · 当前使用 #{rank}")
+        self._update_rank_detail(entry)
+        if hasattr(self, "proj_manual_seed"):
+            self.proj_manual_seed.setText(str(seed))
+            self.proj_manual_x.setText(str(bx))
+            self.proj_manual_z.setText(str(bz))
+            self.trigger_floor_preview_update()
+        obs_text = "未计算(快速模式)" if obs is None else str(obs)
+        y_text = f", 挂机Y: {ay}" if ay is not None else ""
+        self.info.setText(
+            f"排名 #{rank} | 种子: {seed} | 规模: {size} | 刷怪格数: {obs_text} | "
+            f"主世界: ({bx}, {bz}){y_text} | 地狱: ({bx // 8}, {bz // 8})")
+        self.upd_log(f"已切换到排名 #{rank}：种子 {seed}，坐标 ({bx}, {bz})。")
+
+        self._rank_render_token = getattr(self, "_rank_render_token", 0) + 1
+        token = self._rank_render_token
+        def render_selected():
+            try:
+                os.makedirs(os.path.join(APP_DIR, "images"), exist_ok=True)
+                dest = os.path.join(APP_DIR, "images", f"rank_{rank}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png")
+                create_slime_map(seed, bx, bz, dest)
+                if token == getattr(self, "_rank_render_token", None):
+                    self.c.i.emit(dest)
+            except Exception as e:
+                self.c.l.emit(f"排名 #{rank} 图片生成失败: {e}")
+        threading.Thread(target=render_selected, daemon=True).start()
+
+    def show_rankings_dialog(self):
+        results = list(getattr(self, "top_50_results", []) or [])
+        if not results:
+            self.upd_log("当前没有排名结果。")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"排名 · {len(results)} 个结果")
+        dlg.resize(900, 590)
+        dlg.setStyleSheet(self.styleSheet())
+        v = QVBoxLayout(dlg)
+        top = QHBoxLayout()
+        hint = QLabel("双击结果即可使用")
+        hint.setObjectName("Muted")
+        jump = QLineEdit()
+        jump.setFixedWidth(90)
+        jump.setPlaceholderText("排名 1-N")
+        jump_btn = QPushButton("跳转")
+        top.addWidget(hint)
+        top.addStretch()
+        top.addWidget(jump)
+        top.addWidget(jump_btn)
+        v.addLayout(top)
+
+        table = QTableWidget(len(results), 9)
+        table.setHorizontalHeaderLabels(["排名", "种子", "规模", "刷怪格数", "主世界 X", "Y", "主世界 Z", "地狱 X", "地狱 Z"])
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(True)
+        for row, entry in enumerate(results):
+            rank, seed, size, obs, bx, bz, ay = entry[:7]
+            values = (rank, seed, size, "" if obs is None else obs, bx, "" if ay is None else ay, bz, bx // 8, bz // 8)
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if col != 1:
+                    item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+                table.setItem(row, col, item)
+        table.resizeColumnsToContents()
+        table.horizontalHeader().setStretchLastSection(True)
+        v.addWidget(table, 1)
+
+        bottom = QHBoxLayout()
+        export_btn = QPushButton("导出 CSV")
+        use_btn = QPushButton("使用所选")
+        use_btn.setObjectName("Primary")
+        close_btn = QPushButton("关闭")
+        bottom.addWidget(export_btn)
+        bottom.addStretch()
+        bottom.addWidget(close_btn)
+        bottom.addWidget(use_btn)
+        v.addLayout(bottom)
+
+        def use_row(row=None, _col=None):
+            if row is None:
+                row = table.currentRow()
+            if row is None or row < 0:
+                return
+            self.apply_ranked_result(row + 1)
+            dlg.accept()
+
+        def jump_to_rank():
+            try:
+                rank = int(jump.text().strip())
+            except Exception:
+                jump.setText("")
+                jump.setPlaceholderText(f"1-{len(results)}")
+                return
+            if rank < 1 or rank > len(results):
+                jump.setText("")
+                jump.setPlaceholderText(f"1-{len(results)}")
+                return
+            table.selectRow(rank - 1)
+            table.scrollToItem(table.item(rank - 1, 0), QAbstractItemView.ScrollHint.PositionAtCenter)
+
+        table.cellDoubleClicked.connect(use_row)
+        use_btn.clicked.connect(lambda: use_row())
+        jump_btn.clicked.connect(jump_to_rank)
+        jump.returnPressed.connect(jump_to_rank)
+        export_btn.clicked.connect(self.export_results)
+        close_btn.clicked.connect(dlg.reject)
+        current_rank = min(max(1, self.rank_select_spin.value()), len(results))
+        table.selectRow(current_rank - 1)
+        dlg.exec()
 
     def _on_manual_done(self, state):
         self._apply_run_state(state)
@@ -2823,7 +2878,7 @@ class SlimeApp(QWidget):
             QGroupBox { border: 1px solid #3a3a3a; border-radius: 4px; margin-top: 10px; padding-top: 10px; font-weight: bold; }
             QTabBar::tab { background: #1a1a1a; border: 1px solid #3a3a3a; padding: 8px 20px; color: #aaa; border-top-left-radius: 4px; border-top-right-radius: 4px; }
             QTabBar::tab:selected { background: #2a2a2a; color: white; border-bottom-color: #2a2a2a; font-weight: bold; }
-            QScrollBar:vertical { background: #1a1a1a; width: 12px; margin: 0px 0px 0px 0px; }
+            QScrollBar:vertical { background: #1a1a1a; width: 12px; margin: 0px; }
             QScrollBar::handle:vertical { background: #444; min-height: 20px; border-radius: 6px; }
             QScrollBar::handle:vertical:hover { background: #555; }
             QScrollBar:horizontal { height: 0px; }
@@ -2841,20 +2896,13 @@ class SlimeApp(QWidget):
         self.sidebar.setStyleSheet("""
             QFrame { background-color: #1a1a1a; border-right: 1px solid #2a2a2a; }
             QPushButton {
-                background: transparent;
-                border: none;
-                color: #cccccc;
-                font-size: 13px;
-                padding: 12px 0px;
-                text-align: left;
-                padding-left: 18px;
+                background: transparent; border: none; color: #cccccc; font-size: 13px;
+                padding: 12px 0px; text-align: left; padding-left: 18px;
                 border-left: 4px solid transparent;
             }
             QPushButton:hover { background-color: #2d2d2d; color: #ffffff; }
             QPushButton:checked {
-                background-color: #333333;
-                color: #ffffff;
-                font-weight: bold;
+                background-color: #333333; color: #ffffff; font-weight: bold;
                 border-left: 4px solid #0078d4;
             }
         """)
@@ -2883,30 +2931,18 @@ class SlimeApp(QWidget):
         self.btn_nav_floor.setIconSize(QSize(24, 24))
         self.btn_nav_floor.setText("  地板生成")
 
-        self.btn_nav_download = QPushButton()
-        self.btn_nav_download.setIcon(icon_shared)
-        self.btn_nav_download.setIconSize(QSize(24, 24))
-        self.btn_nav_download.setText("  在线投影下载")
-
-        self.btn_nav_extend = QPushButton()
-        self.btn_nav_extend.setIcon(icon_shared)
-        self.btn_nav_extend.setIconSize(QSize(24, 24))
-        self.btn_nav_extend.setText("  延长已下载投影")
-
         self.btn_nav_settings = QPushButton()
         self.btn_nav_settings.setIcon(icon_gear)
         self.btn_nav_settings.setIconSize(QSize(24, 24))
         self.btn_nav_settings.setText("  高级设置")
 
-        for btn in [self.btn_nav_search, self.btn_nav_floor, self.btn_nav_download, self.btn_nav_extend]:
+        for btn in [self.btn_nav_search, self.btn_nav_floor]:
             btn.setCheckable(True)
             sidebar_layout.addWidget(btn)
 
         self.nav_group = QButtonGroup(self)
         self.nav_group.addButton(self.btn_nav_search, 0)
         self.nav_group.addButton(self.btn_nav_floor, 1)
-        self.nav_group.addButton(self.btn_nav_download, 2)
-        self.nav_group.addButton(self.btn_nav_extend, 3)
         self.btn_nav_search.setChecked(True)
 
         sidebar_layout.addStretch()
@@ -2914,15 +2950,11 @@ class SlimeApp(QWidget):
         self.btn_nav_settings.clicked.connect(self.open_settings)
 
         global_layout.addWidget(self.sidebar)
-
         self.stacked = QStackedWidget(self)
         global_layout.addWidget(self.stacked)
 
         self.setup_search_page()
         self.setup_floor_page()
-        self.setup_download_page()
-        self.setup_extend_page()
-
         self.nav_group.idClicked.connect(self.on_nav_changed)
 
     def toggle_sidebar(self):
@@ -2943,14 +2975,10 @@ class SlimeApp(QWidget):
         if self.is_sidebar_expanded:
             self.btn_nav_search.setText("  搜索界面")
             self.btn_nav_floor.setText("  地板生成")
-            self.btn_nav_download.setText("  在线投影下载")
-            self.btn_nav_extend.setText("  延长已下载投影")
             self.btn_nav_settings.setText("  高级设置")
         else:
             self.btn_nav_search.setText("")
             self.btn_nav_floor.setText("")
-            self.btn_nav_download.setText("")
-            self.btn_nav_extend.setText("")
             self.btn_nav_settings.setText("")
 
         self.sidebar_anim.start()
@@ -2958,13 +2986,6 @@ class SlimeApp(QWidget):
 
     def on_nav_changed(self, page_id):
         self.stacked.setCurrentIndex(page_id)
-        if page_id == 2 and not self.cloud_fetched:
-            self.fetch_zip_data(force_refresh=False)
-        elif page_id == 3:
-            if self.last_downloaded_path and os.path.exists(self.last_downloaded_path):
-                self.ext_input_file.setText(self.last_downloaded_path)
-                self.last_downloaded_path = ""
-                self.browse_input_schematic(auto_path=self.ext_input_file.text())
 
     def open_settings_dialog(self):
         self.open_settings()
@@ -3086,6 +3107,59 @@ class SlimeApp(QWidget):
         right_panel = QWidget()
         right_v = QVBoxLayout(right_panel)
         right_v.setContentsMargins(15, 15, 15, 15)
+
+        # 排名功能默认收起，避免破坏主界面的简洁感；需要时再展开完整控件。
+        result_group = QGroupBox("排名结果")
+        result_v = QVBoxLayout(result_group)
+        result_top = QHBoxLayout()
+        self.result_status_label = QLabel("尚未产生排名结果")
+        self.result_status_label.setStyleSheet("font-weight: bold; color: #aeb7c2;")
+        result_top.addWidget(self.result_status_label, 1)
+
+        self.rank_toggle_btn = QPushButton("查看排名")
+        self.rank_toggle_btn.setEnabled(False)
+        self.rank_toggle_btn.setFixedWidth(92)
+        self.rank_toggle_btn.clicked.connect(self._toggle_rank_panel)
+        result_top.addWidget(self.rank_toggle_btn)
+        result_v.addLayout(result_top)
+
+        self.rank_panel = QWidget()
+        rank_panel_v = QVBoxLayout(self.rank_panel)
+        rank_panel_v.setContentsMargins(0, 6, 0, 0)
+        rank_panel_v.setSpacing(6)
+
+        rank_actions = QHBoxLayout()
+        rank_actions.addWidget(QLabel("使用第"))
+        self.rank_select_spin = QSpinBox()
+        self.rank_select_spin.setRange(1, 1)
+        self.rank_select_spin.setValue(1)
+        self.rank_select_spin.setEnabled(False)
+        self.rank_select_spin.setFixedWidth(82)
+        rank_actions.addWidget(self.rank_select_spin)
+        rank_actions.addWidget(QLabel("名"))
+
+        self.rank_apply_btn = QPushButton("使用该排名")
+        self.rank_list_btn = QPushButton("排名列表")
+        self.rank_export_btn = QPushButton("导出 CSV")
+        for b in (self.rank_apply_btn, self.rank_list_btn, self.rank_export_btn):
+            b.setEnabled(False)
+        self.rank_apply_btn.clicked.connect(self.apply_ranked_result)
+        self.rank_list_btn.clicked.connect(self.show_rankings_dialog)
+        self.rank_export_btn.clicked.connect(self.export_results)
+        self.rank_select_spin.valueChanged.connect(self.preview_ranked_result)
+        rank_actions.addWidget(self.rank_apply_btn)
+        rank_actions.addWidget(self.rank_list_btn)
+        rank_actions.addWidget(self.rank_export_btn)
+        rank_actions.addStretch(1)
+        rank_panel_v.addLayout(rank_actions)
+
+        self.rank_detail_label = QLabel("搜索完成后，这里会显示第 1～N 名；排名可直接切换成当前坐标和地板投影中心。")
+        self.rank_detail_label.setStyleSheet("color: #7f8a96; font-size: 11px;")
+        self.rank_detail_label.setWordWrap(True)
+        rank_panel_v.addWidget(self.rank_detail_label)
+        self.rank_panel.setVisible(False)
+        result_v.addWidget(self.rank_panel)
+        right_v.addWidget(result_group)
 
         verify_group = QGroupBox("验证坐标")
         verify_layout = QHBoxLayout(verify_group)
@@ -3370,6 +3444,7 @@ class SlimeApp(QWidget):
                 "image": state.get("history_image", ""),
                 "algorithm": state.get("current_algorithm", "未知算法"),
                 "search_params": state.get("search_params", {}),
+                "ranked_results": state.get("ranked_results", state.get("top_50_results", [])),
                 "projection": self.collect_projection_settings(),
             }
             history_path = os.path.join(APP_DIR, "history", f"search_{timestamp}.json")
@@ -3551,801 +3626,6 @@ class SlimeApp(QWidget):
             except Exception:
                 pass
 
-    def setup_download_page(self):
-        page = QWidget()
-        cloud_layout = QVBoxLayout(page)
-        cloud_layout.setContentsMargins(15, 15, 15, 15)
-
-        cloud_top_bar = QHBoxLayout()
-        cloud_title = QLabel("社区在线共享投影")
-        cloud_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #fff;")
-        self.btn_refresh_cloud = QPushButton("强制刷新网络数据")
-        self.btn_refresh_cloud.setFixedSize(140, 30)
-        self.btn_refresh_cloud.clicked.connect(lambda: self.fetch_zip_data(force_refresh=True))
-
-        cloud_top_bar.addWidget(cloud_title)
-        cloud_top_bar.addStretch()
-        cloud_top_bar.addWidget(self.btn_refresh_cloud)
-        cloud_layout.addLayout(cloud_top_bar)
-
-        self.cloud_scroll = QScrollArea()
-        self.cloud_scroll.setWidgetResizable(True)
-        self.cloud_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-
-        self.cloud_container = QWidget()
-        self.cloud_grid = QGridLayout(self.cloud_container)
-        self.cloud_grid.setSpacing(15)
-        self.cloud_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
-
-        self.cloud_scroll.setWidget(self.cloud_container)
-        cloud_layout.addWidget(self.cloud_scroll)
-
-        self.stacked.addWidget(page)
-
-    def setup_extend_page(self):
-        page = QWidget()
-        ext_main_layout = QHBoxLayout(page)
-        ext_main_layout.setContentsMargins(15, 15, 15, 15)
-        ext_main_layout.setSpacing(20)
-
-        left_ctrl_panel = QWidget()
-        left_ctrl_panel.setMaximumWidth(450)
-        ext_layout = QVBoxLayout(left_ctrl_panel)
-
-        info_label = QLabel("直接输入你期望的可用总格数，程序会自动推算循环节，尺寸不符会给出最优建议")
-        info_label.setStyleSheet("color: #aaa; font-style: italic; padding: 5px;")
-        ext_layout.addWidget(info_label)
-
-        ext_form_container = QWidget()
-        ext_form_layout = QFormLayout(ext_form_container)
-
-        ext_file_layout = QHBoxLayout()
-        self.ext_input_file = QLineEdit()
-        self.ext_input_file.setPlaceholderText("选择 Litematic 投影...")
-        self.ext_browse_btn = QPushButton("浏览...")
-        self.ext_browse_btn.clicked.connect(self.browse_input_schematic)
-        ext_file_layout.addWidget(self.ext_input_file)
-        ext_file_layout.addWidget(self.ext_browse_btn)
-        ext_form_layout.addRow("选择投影:", ext_file_layout)
-
-        self.label_fixed_ext = QLabel("固定链期望\n可用长度(格):")
-        self.spin_fixed_ext = QSpinBox()
-        self.spin_fixed_ext.setRange(0, 50000)
-        self.spin_fixed_ext.setFixedWidth(80)
-        self.spin_fixed_ext.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-
-        fixed_ctrl_h = QHBoxLayout()
-        fixed_ctrl_h.addWidget(self.spin_fixed_ext)
-        fixed_ctrl_h.addStretch()
-        self.lbl_fixed_avail = QLabel("计算中...")
-        self.lbl_fixed_avail.setStyleSheet("color: #ff9800;")
-
-        self.label_moving_ext = QLabel("移动链期望\n可用长度(格):")
-        self.spin_moving_ext = QSpinBox()
-        self.spin_moving_ext.setRange(0, 50000)
-        self.spin_moving_ext.setFixedWidth(80)
-        self.spin_moving_ext.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-
-        moving_ctrl_h = QHBoxLayout()
-        moving_ctrl_h.addWidget(self.spin_moving_ext)
-        moving_ctrl_h.addStretch()
-        self.lbl_moving_avail = QLabel("计算中...")
-        self.lbl_moving_avail.setStyleSheet("color: #00bcd4;")
-
-        self.proj_filter = DisableWheelFilter()
-        for widget in [self.spin_fixed_ext, self.spin_moving_ext]:
-            widget.valueChanged.connect(self.update_realtime_preview)
-            widget.installEventFilter(self.proj_filter)
-
-        for w in [self.label_fixed_ext, self.lbl_fixed_avail, self.label_moving_ext, self.lbl_moving_avail, self.spin_fixed_ext, self.spin_moving_ext]:
-            w.setVisible(False)
-
-        ext_form_layout.addRow(self.label_fixed_ext, fixed_ctrl_h)
-        ext_form_layout.addRow("", self.lbl_fixed_avail)
-        ext_form_layout.addRow(self.label_moving_ext, moving_ctrl_h)
-        ext_form_layout.addRow("", self.lbl_moving_avail)
-
-        ext_layout.addWidget(ext_form_container)
-
-        ext_btn = QPushButton("导出投影蓝图")
-        ext_btn.setFixedHeight(50)
-        ext_btn.setStyleSheet("background-color: #2b4c7e; font-size: 16px; font-weight: bold; border-radius: 6px;")
-        ext_btn.clicked.connect(self.export_extended_schematic)
-        ext_layout.addWidget(ext_btn)
-        ext_layout.addStretch()
-
-        preview_group = QGroupBox("拼接投影预览蓝图")
-        preview_v = QVBoxLayout(preview_group)
-        self.scroll_preview = QScrollArea()
-        self.scroll_preview.setStyleSheet("background: #151515;")
-        self.lbl_preview = QLabel("导入投影并输入期望格数，此处将自动吸附有效长度并生成蓝图...")
-        self.lbl_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.scroll_preview.setWidget(self.lbl_preview)
-        self.scroll_preview.setWidgetResizable(True)
-        preview_v.addWidget(self.scroll_preview)
-
-        ext_main_layout.addWidget(left_ctrl_panel)
-        ext_main_layout.addWidget(preview_group, 1)
-
-        self.stacked.addWidget(page)
-
-    def fetch_zip_data(self, force_refresh=True):
-        if hasattr(self, "zip_thread") and self.zip_thread and self.zip_thread.isRunning():
-            self.zip_thread.requestInterruption()
-            self.zip_thread.wait(1500)
-
-        self.btn_refresh_cloud.setEnabled(False)
-        self.btn_refresh_cloud.setText("处理中...")
-
-        while self.cloud_grid.count():
-            child = self.cloud_grid.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
-
-        self.zip_thread = ZipCoverFetchThread(force_refresh=force_refresh)
-        self.zip_thread.covers_ready.connect(self.populate_cloud_grid)
-        self.zip_thread.status_update.connect(lambda msg: self.btn_refresh_cloud.setText(msg))
-        self.zip_thread.start()
-
-    def populate_cloud_grid(self, image_paths):
-        self.btn_refresh_cloud.setEnabled(True)
-        self.btn_refresh_cloud.setText("强制刷新网络数据")
-        self.cloud_fetched = True
-
-        if image_paths and isinstance(image_paths[0], str) and image_paths[0].startswith("ERROR:"):
-            QMessageBox.critical(self, "访问服务器被拦截", image_paths[0][6:])
-            lbl = QLabel("下载被拦截或出错，详情见弹窗。")
-            lbl.setStyleSheet("color: #ff4444; font-size: 16px; font-weight: bold;")
-            self.cloud_grid.addWidget(lbl, 0, 0)
-            return
-
-        if not image_paths:
-            lbl = QLabel("未能解压出任何图片文件。")
-            lbl.setStyleSheet("color: #888;")
-            self.cloud_grid.addWidget(lbl, 0, 0)
-            return
-
-        for i, img_path in enumerate(image_paths):
-            row = i // 5
-            col = i % 5
-            card = self.create_mod_card_from_image(img_path, i + 1)
-            self.cloud_grid.addWidget(card, row, col)
-
-    def create_mod_card_from_image(self, img_path, index):
-        card = QFrame()
-        card.setFixedSize(200, 190)
-        card.setStyleSheet("""
-            QFrame { background-color: #242526; border-radius: 8px; border: 1px solid #3a3b3c; }
-            QFrame:hover { border: 1px solid #5c5c5c; background-color: #2a2b2c; }
-        """)
-
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        img_label = ClickableLabel()
-        img_label.setFixedSize(198, 111)
-        img_label.setStyleSheet("border-top-left-radius: 8px; border-top-right-radius: 8px; background-color: #18191a;")
-        img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        pixmap = QPixmap(img_path)
-        img_label.setPixmap(pixmap.scaled(198, 111, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation))
-
-        filename = os.path.basename(img_path)
-        name_without_ext = os.path.splitext(filename)[0]
-        clean_name = re.sub(r'^\d+[_.\-\s]+', '', name_without_ext)
-
-        author = "社区分享"
-        title = clean_name
-
-        if clean_name.startswith("[") and "]" in clean_name:
-            parts = clean_name.split("]", 1)
-            author = parts[0][1:]
-            title = parts[1].strip()
-
-        mock_filename = f"{clean_name}.litematic"
-        mock_path = os.path.join(APP_DIR, "assets", "covers_cache", mock_filename)
-
-        def simulate_download(target_path, name):
-            if not os.path.exists(target_path):
-                with open(target_path, "w", encoding="utf-8") as f:
-                    f.write("MOCK LITEMATIC NBT STRUCTURE")
-            self.last_downloaded_path = target_path
-            QMessageBox.information(self, "下载完成", f"已虚拟成功生成本地缓存投影:\n{name}\n\n联动：切换到“延长已下载投影”页面即可自动加载该文件")
-
-        img_label.clicked.connect(lambda: simulate_download(mock_path, mock_filename))
-        layout.addWidget(img_label)
-
-        info_widget = QWidget()
-        info_layout = QVBoxLayout(info_widget)
-        info_layout.setContentsMargins(10, 8, 10, 8)
-        info_layout.setSpacing(2)
-
-        title_lbl = QLabel(title)
-        title_lbl.setFixedHeight(36)
-        title_lbl.setStyleSheet("font-size: 13px; font-weight: bold; color: #e4e6eb; border: none; background: transparent;")
-        title_lbl.setWordWrap(True)
-        title_lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-
-        author_lbl = QLabel(f"作者: {author}")
-        author_lbl.setStyleSheet("font-size: 12px; color: #b0b3b8; border: none; background: transparent;")
-
-        info_layout.addWidget(title_lbl)
-        info_layout.addStretch()
-        info_layout.addWidget(author_lbl)
-        layout.addWidget(info_widget)
-
-        return card
-
-    def calc_fixed_avail(self, target_avail, base_len, cycle_len, blind_spot):
-        if cycle_len <= 0:
-            return 0, 0, False, "缺少固定链循环节数据"
-        base_avail = base_len - blind_spot
-        if target_avail <= base_avail:
-            return 0, 0, True, ""
-
-        target_ext = target_avail - base_avail
-        cycles = int(target_ext // cycle_len)
-        rem = int(target_ext % cycle_len)
-
-        has_tail = False
-        available_rems = set()
-        if self.loaded_schem:
-            for n in self.loaded_schem.regions.keys():
-                if "盲区" in n:
-                    continue
-                if any(k in n for k in ["固定", "主", "cce", "复位"]) and any(k in n for k in ["尾", "末端"]):
-                    match = re.search(r'\((\d+)\)', n)
-                    if match:
-                        tail_rem = int(match.group(1))
-                        available_rems.add(tail_rem)
-                        if tail_rem == rem:
-                            has_tail = True
-                    else:
-                        available_rems.add(0)
-                        if rem == 0:
-                            has_tail = True
-
-        if has_tail:
-            return cycles, rem, True, ""
-
-        if not available_rems:
-            available_rems.add(0)
-        possible_lengths = []
-        for c in (cycles - 1, cycles, cycles + 1):
-            if c < 0:
-                continue
-            for r in available_rems:
-                possible_lengths.append(base_avail + c * cycle_len + r)
-
-        lower = max([l for l in possible_lengths if l < target_avail], default=base_avail)
-        upper = min([l for l in possible_lengths if l > target_avail], default=base_avail + cycle_len)
-        msg = f"无法延长到 {target_avail} 格。可选择：{lower} 或 {upper}"
-        return cycles, rem, False, msg
-
-    def calc_moving_avail(self, target_avail, base_len, cycle_len, blind_spot):
-        if cycle_len <= 0:
-            return 0, 0, False, "缺少移动链循环节数据"
-        base_avail = base_len - blind_spot
-        if target_avail <= base_avail:
-            return 0, 0, True, ""
-
-        target_ext = target_avail - base_avail
-        cycles = int(target_ext // cycle_len)
-        rem = int(target_ext % cycle_len)
-
-        has_tail = False
-        available_rems = set()
-        if self.loaded_schem:
-            for n in self.loaded_schem.regions.keys():
-                if "盲区" in n:
-                    continue
-                if any(k in n for k in ["移动"]) and any(k in n for k in ["尾", "末端"]):
-                    match = re.search(r'\((\d+)\)', n)
-                    if match:
-                        tail_rem = int(match.group(1))
-                        available_rems.add(tail_rem)
-                        if tail_rem == rem:
-                            has_tail = True
-                    else:
-                        available_rems.add(0)
-                        if rem == 0:
-                            has_tail = True
-
-        if has_tail:
-            return cycles, rem, True, ""
-
-        if not available_rems:
-            available_rems.add(0)
-        possible_lengths = []
-        for c in (cycles - 1, cycles, cycles + 1):
-            if c < 0:
-                continue
-            for r in available_rems:
-                possible_lengths.append(base_avail + c * cycle_len + r)
-
-        lower = max([l for l in possible_lengths if l < target_avail], default=base_avail)
-        upper = min([l for l in possible_lengths if l > target_avail], default=base_avail + cycle_len)
-        msg = f"无法延长到 {target_avail} 格。可选择：{lower} 或 {upper}"
-        return cycles, rem, False, msg
-
-    def recalc_lengths(self):
-        if getattr(self, 'loaded_schem', None) is None:
-            return
-        fixed_all, moving_all = [], []
-        fixed_cycles, moving_cycles = [], []
-
-        for n, r in self.loaded_schem.regions.items():
-            if "盲区" in n:
-                continue
-
-            is_mov = any(k in n for k in ["移动"])
-            is_fix = any(k in n for k in ["固定", "主", "cce", "复位"])
-            is_cyc = any(k in n for k in ["循环", "单元"])
-            is_tail = any(k in n for k in ["尾", "末端"])
-
-            is_alt_tail = False
-            if is_tail:
-                match = re.search(r'\((\d+)\)', n)
-                if match and int(match.group(1)) != 0:
-                    is_alt_tail = True
-
-            if is_mov:
-                if not is_alt_tail:
-                    moving_all.append(r)
-                if is_cyc:
-                    moving_cycles.append(r)
-            elif is_fix:
-                if not is_alt_tail:
-                    fixed_all.append(r)
-                if is_cyc:
-                    fixed_cycles.append(r)
-            else:
-                if not is_alt_tail:
-                    fixed_all.append(r)
-
-        if "X" in self.fixed_axis_dir:
-            self.base_len_f = max((r.x + r.width for r in fixed_all), default=0) - min((r.x for r in fixed_all), default=0) if fixed_all else 0
-            self.cycle_len_f = fixed_cycles[0].width if fixed_cycles else 0
-        else:
-            self.base_len_f = max((r.z + r.length for r in fixed_all), default=0) - min((r.z for r in fixed_all), default=0) if fixed_all else 0
-            self.cycle_len_f = fixed_cycles[0].length if fixed_cycles else 0
-
-        if "X" in self.moving_axis_dir:
-            self.base_len_m = max((r.x + r.width for r in moving_all), default=0) - min((r.x for r in moving_all), default=0) if moving_all else 0
-            self.cycle_len_m = moving_cycles[0].width if moving_cycles else 0
-        else:
-            self.base_len_m = max((r.z + r.length for r in moving_all), default=0) - min((r.z for r in moving_all), default=0) if moving_all else 0
-            self.cycle_len_m = moving_cycles[0].length if moving_cycles else 0
-
-    def update_realtime_avail(self):
-        if getattr(self, '_is_loading_schem', False):
-            return
-
-        if self.spin_fixed_ext.isVisible():
-            t_avail = self.spin_fixed_ext.value()
-            cycles, rem, is_valid, msg = self.calc_fixed_avail(t_avail, self.base_len_f, self.cycle_len_f, self.fixed_blind_total)
-            self.actual_fixed_cycles = cycles if is_valid else 0
-            self.fixed_remainder = rem if is_valid else 0
-            self.lbl_fixed_avail.setText(msg)
-            if "无法延长" in msg:
-                self.lbl_fixed_avail.setStyleSheet("color: #ff2222; font-weight: bold;")
-            else:
-                self.lbl_fixed_avail.setStyleSheet("color: #ff9800;")
-
-        if self.spin_moving_ext.isVisible():
-            t_avail = self.spin_moving_ext.value()
-            cycles, rem, is_valid, msg = self.calc_moving_avail(t_avail, self.base_len_m, self.cycle_len_m, self.moving_blind_total)
-            self.actual_moving_cycles = cycles if is_valid else 0
-            self.moving_remainder = rem if is_valid else 0
-            self.lbl_moving_avail.setText(msg)
-            if "无法延长" in msg:
-                self.lbl_moving_avail.setStyleSheet("color: #ff2222; font-weight: bold;")
-            else:
-                self.lbl_moving_avail.setStyleSheet("color: #00bcd4;")
-
-    def get_offset(self, axis_dir, offset_val):
-        if "+Z" in axis_dir: return 0, offset_val
-        if "+X" in axis_dir: return offset_val, 0
-        if "-Z" in axis_dir: return 0, -offset_val
-        if "-X" in axis_dir: return -offset_val, 0
-        return 0, offset_val
-
-    def browse_input_schematic(self, auto_path=""):
-        if not HAS_LITEMAPY:
-            return QMessageBox.warning(self, "缺少组件", "请安装 litemapy")
-
-        fn = auto_path
-        if not fn:
-            fn, _ = QFileDialog.getOpenFileName(self, "选择原始投影", "", "Litematica (*.litematic)")
-
-        if fn:
-            try:
-                file_size = os.path.getsize(fn)
-            except OSError as e:
-                return QMessageBox.warning(self, "错误", f"无法读取投影文件: {e}")
-            if file_size > MAX_LITEMATIC_BYTES:
-                limit_mb = MAX_LITEMATIC_BYTES // (1024 * 1024)
-                return QMessageBox.warning(self, "文件过大", f"投影文件超过 {limit_mb}MB，已拒绝加载。")
-            self.ext_input_file.setText(fn)
-            self.lbl_preview.setText("正在后台异步解析投影文件，这可能需要几十秒，请耐心等待...")
-            self.upd_log("正在后台异步解析投影文件，请耐心等待...")
-
-            self.ext_browse_btn.setEnabled(False)
-            self._is_loading_schem = True
-            threading.Thread(target=self._thread_load, args=(fn,), daemon=True).start()
-
-    def _thread_load(self, fn):
-        try:
-            if not os.path.exists(fn) or os.path.getsize(fn) < 100:
-                self.c.schem_loaded.emit(False, None, "文件暂未下载，仅为路径占位符结构")
-                return
-            loaded = Schematic.load(fn)
-            self.c.schem_loaded.emit(True, loaded, fn)
-        except Exception as e:
-            self.c.l.emit(f"解析错误: {e}")
-            self.c.schem_loaded.emit(False, None, str(e))
-
-    def _on_schem_loaded(self, success, schem, msg):
-        self.ext_browse_btn.setEnabled(True)
-        try:
-            if not success:
-                self.lbl_preview.setText(f"由于是Mock下载生成，若非真实NBT结构会解析挂起: {msg}")
-                self._is_loading_schem = False
-                return
-
-            self.loaded_schem = schem
-            fn = msg
-            self.latest_extended_schem = None
-            has_fixed, has_moving = False, False
-            fixed_all, moving_all = [], []
-
-            self.fixed_blind_total = 0
-            self.moving_blind_total = 0
-            fixed_head = fixed_tail = moving_head = moving_tail = 0
-
-            for n, r in self.loaded_schem.regions.items():
-                if "头部盲区" in n:
-                    fixed_head = r.width - 1
-                    moving_head = r.length - 1
-                elif "尾部盲区" in n:
-                    fixed_tail = r.width - 1
-                    moving_tail = r.length - 1
-
-                if "盲区" in n:
-                    continue
-
-                is_mov = any(k in n for k in ["移动"])
-                if is_mov:
-                    has_moving = True
-                    moving_all.append(r)
-                else:
-                    has_fixed = True
-                    fixed_all.append(r)
-
-            if fixed_head > 0 or fixed_tail > 0:
-                self.fixed_blind_total = fixed_head + fixed_tail
-                self.upd_log(f"捕捉到固定链盲区标记，总盲区: {self.fixed_blind_total} 格")
-            if moving_head > 0 or moving_tail > 0:
-                self.moving_blind_total = moving_head + moving_tail
-                self.upd_log(f"捕捉到移动链盲区标记，总盲区: {self.moving_blind_total} 格")
-
-            if fixed_all:
-                w = max(r.x + r.width for r in fixed_all) - min(r.x for r in fixed_all)
-                l = max(r.z + r.length for r in fixed_all) - min(r.z for r in fixed_all)
-                self.fixed_axis_dir = "+X" if w > l else "+Z"
-
-            if moving_all:
-                w = max(r.x + r.width for r in moving_all) - min(r.x for r in moving_all)
-                l = max(r.z + r.length for r in moving_all) - min(r.z for r in moving_all)
-                self.moving_axis_dir = "+X" if w > l else "+Z"
-
-            self.recalc_lengths()
-
-            if has_fixed:
-                self.spin_fixed_ext.setValue(max(0, self.base_len_f - self.fixed_blind_total))
-            if has_moving:
-                self.spin_moving_ext.setValue(max(0, self.base_len_m - self.moving_blind_total))
-
-            for w in [self.label_fixed_ext, self.spin_fixed_ext, self.lbl_fixed_avail]:
-                w.setVisible(has_fixed)
-            for w in [self.label_moving_ext, self.spin_moving_ext, self.lbl_moving_avail]:
-                w.setVisible(has_moving)
-
-            self._is_loading_schem = False
-            self.update_realtime_preview()
-
-            real_version = "未知"
-            if hasattr(self.loaded_schem, 'minecraft_data_version'):
-                real_version = self.loaded_schem.minecraft_data_version
-            elif hasattr(self.loaded_schem, 'data_version'):
-                real_version = self.loaded_schem.data_version
-
-            self.upd_log(f"投影解析成功: {os.path.basename(fn)} (内部版本号: {real_version})")
-        except Exception as e:
-            self._is_loading_schem = False
-            self.lbl_preview.setText(f"投影加载后初始化失败: {e}")
-            self.upd_log(f"投影加载后初始化失败: {e}")
-
-    def update_realtime_preview(self):
-        if getattr(self, '_is_loading_schem', False) or not self.loaded_schem:
-            return
-        if hasattr(self, '_render_timer'):
-            self._render_timer.stop()
-        self._render_timer = QTimer()
-        self._render_timer.setSingleShot(True)
-        self._render_timer.timeout.connect(self._do_render_logic)
-        self._render_timer.start(300)
-
-    def _do_render_logic(self):
-        if getattr(self, '_is_rendering', False):
-            self._render_timer.start(500)
-            return
-        self._is_rendering = True
-        self.update_realtime_avail()
-        self.lbl_preview.setText("正在后台拼装并渲染蓝图，这可能需要几十秒，请等待...")
-
-        params = {
-            'fixed_visible': self.spin_fixed_ext.isVisible(),
-            'moving_visible': self.spin_moving_ext.isVisible(),
-            'fixed_cycles': self.actual_fixed_cycles,
-            'moving_cycles': self.actual_moving_cycles,
-            'fixed_remainder': getattr(self, 'fixed_remainder', 0),
-            'moving_remainder': getattr(self, 'moving_remainder', 0),
-            'fixed_val': self.spin_fixed_ext.value() if self.spin_fixed_ext.isVisible() else 0,
-            'moving_val': self.spin_moving_ext.value() if self.spin_moving_ext.isVisible() else 0,
-            'fixed_axis_dir': self.fixed_axis_dir,
-            'moving_axis_dir': self.moving_axis_dir,
-            'cycle_len_f': self.cycle_len_f,
-            'cycle_len_m': self.cycle_len_m,
-        }
-        threading.Thread(target=self._thread_build_and_render, args=(params,), daemon=True).start()
-
-    def _thread_build_and_render(self, params):
-        painter = None
-        try:
-            new_schem = self.build_extended_schematic(params)
-
-            target = new_schem if new_schem else self.loaded_schem
-            if not target:
-                self.c.render_done.emit(None, None)
-                return
-
-            min_x = min((r.x for r in target.regions.values()), default=0)
-            min_z = min((r.z for r in target.regions.values()), default=0)
-            max_x = max((r.x + r.width for r in target.regions.values()), default=0)
-            max_z = max((r.z + r.length for r in target.regions.values()), default=0)
-            min_y = min((r.y for r in target.regions.values()), default=0)
-            max_y = max((r.y + r.height for r in target.regions.values()), default=0)
-
-            w, h, height_diff = max_x - min_x, max_z - min_z, max(1, max_y - min_y)
-            if w <= 0 or h <= 0:
-                self.c.render_done.emit(None, new_schem)
-                return
-
-            scale = min(15, max(2, 3000 // max(w, h)))
-            img = QImage(w * scale, h * scale, QImage.Format.Format_ARGB32)
-            img.fill(QColor(20, 20, 20))
-            painter = QPainter(img)
-
-            transparent_air_ids = {"minecraft:air", "minecraft:cave_air", "minecraft:void_air"}
-            regions = list(target.regions.values())
-
-            for gx in range(min_x, max_x):
-                draw_x = (gx - min_x) * scale
-                for gz in range(min_z, max_z):
-                    draw_z = (gz - min_z) * scale
-                    base_c = None
-                    visible_y = min_y
-                    for y in range(max_y - 1, min_y - 1, -1):
-                        for r in regions:
-                            if gx < r.x or gx >= r.x + r.width:
-                                continue
-                            if gz < r.z or gz >= r.z + r.length:
-                                continue
-                            if y < r.y or y >= r.y + r.height:
-                                continue
-                            block = r[gx - r.x, y - r.y, gz - r.z]
-                            block_id = block.id
-                            if block_id in transparent_air_ids:
-                                continue
-                            base_c = self.get_block_color(block_id)
-                            if base_c is None or base_c.alpha() <= 0:
-                                base_c = None
-                                continue
-                            visible_y = y
-                            break
-                        if base_c is not None:
-                            break
-                    if base_c is None:
-                        continue
-                    depth_factor = 0.3 + (0.8 * (visible_y - min_y) / height_diff)
-                    final_c = QColor(
-                        min(255, int(base_c.red() * depth_factor)),
-                        min(255, int(base_c.green() * depth_factor)),
-                        min(255, int(base_c.blue() * depth_factor)),
-                        base_c.alpha()
-                    )
-                    painter.fillRect(draw_x, draw_z, scale, scale, final_c)
-                    painter.setPen(QColor(0, 0, 0, 60))
-                    painter.drawRect(draw_x, draw_z, scale, scale)
-            painter.end()
-            self.c.render_done.emit(img, new_schem)
-        except Exception as e:
-            try:
-                if painter is not None and painter.isActive():
-                    painter.end()
-            except Exception:
-                pass
-            self.c.l.emit(f"渲染错误: {e}")
-            self.c.render_done.emit(None, None)
-
-    def _on_render_done(self, img, schem):
-        self._is_rendering = False
-        self.latest_extended_schem = schem
-        if img:
-            self.lbl_preview.setPixmap(QPixmap.fromImage(img))
-        elif schem:
-            self.lbl_preview.setText("投影已拼装，但预览图为空；仍可尝试导出。")
-        else:
-            self.lbl_preview.setText("投影预览生成失败，请查看左侧日志。")
-
-    def build_extended_schematic(self, params):
-        schem = self.loaded_schem
-        fixed_cycles, fixed_tails, fixed_others = [], [], []
-        moving_cycles, moving_tails, moving_others = [], [], []
-        global_others = []
-
-        for n, r in schem.regions.items():
-            if "盲区" in n:
-                continue
-
-            is_mov = any(k in n for k in ["移动"])
-            is_fix = any(k in n for k in ["固定", "主", "cce", "复位"])
-            is_cyc = any(k in n for k in ["循环", "单元"])
-            is_tail = any(k in n for k in ["尾", "末端"])
-
-            if is_mov:
-                if is_cyc:
-                    moving_cycles.append((n, r))
-                elif is_tail:
-                    moving_tails.append((n, r))
-                else:
-                    moving_others.append((n, r))
-            elif is_fix:
-                if is_cyc:
-                    fixed_cycles.append((n, r))
-                elif is_tail:
-                    fixed_tails.append((n, r))
-                else:
-                    global_others.append((n, r))
-            else:
-                global_others.append((n, r))
-
-        copies_f = params['fixed_cycles'] if params['fixed_visible'] else 0
-        copies_m = params['moving_cycles'] if params['moving_visible'] else 0
-        fixed_remainder = params['fixed_remainder'] if params['fixed_visible'] else 0
-        moving_remainder = params['moving_remainder'] if params['moving_visible'] else 0
-
-        dx_f_base, dz_f_base = self.get_offset(params['fixed_axis_dir'], params['cycle_len_f'] * copies_f)
-        dx_m, dz_m = self.get_offset(params['moving_axis_dir'], params['cycle_len_m'] * copies_m)
-
-        original_author = "Unknown"
-        if hasattr(schem, 'author') and schem.author:
-            original_author = str(schem.author)
-
-        original_name = str(schem.name) if getattr(schem, 'name', None) else "something"
-
-        # Match litemapy's supported default instead of emitting an invalid
-        # placeholder data version when the source lacks metadata.
-        original_version = 2975
-        if hasattr(schem, 'mc_version') and schem.mc_version:
-            original_version = int(schem.mc_version)
-
-        fixed_val = params['fixed_val']
-        moving_val = params['moving_val']
-
-        if params['fixed_visible'] and params['moving_visible']:
-            size_str = f"{fixed_val}x{moving_val}"
-        elif params['fixed_visible']:
-            size_str = f"{fixed_val}"
-        elif params['moving_visible']:
-            size_str = f"{moving_val}"
-        else:
-            size_str = "0"
-
-        schem_name = f"[{original_author}] {original_name} (可用格数{size_str})"
-        new_schem = Schematic(name=schem_name, author=original_author, mc_version=original_version)
-
-        def clone_reg_dir(src, dx, dy, dz):
-            return clone_litematic_region(src, dx, dy, dz)
-
-        for n, r in global_others + moving_others:
-            new_schem.regions[n] = clone_reg_dir(r, 0, 0, 0)
-
-        for n, r in fixed_cycles:
-            new_schem.regions[n] = clone_reg_dir(r, 0, 0, 0)
-            for i in range(copies_f):
-                cdx, cdz = self.get_offset(params['fixed_axis_dir'], (i + 1) * params['cycle_len_f'])
-                new_schem.regions[f"{n}_ext_{i + 1}"] = clone_reg_dir(r, cdx, 0, cdz)
-
-        target_f_tail = None
-        default_f_tail = None
-
-        for n, r in fixed_tails:
-            match = re.search(r'\((\d+)\)', n)
-            if not match or int(match.group(1)) == 0:
-                default_f_tail = (n, r)
-                break
-
-        for n, r in fixed_tails:
-            match = re.search(r'\((\d+)\)', n)
-            if match and int(match.group(1)) == fixed_remainder:
-                target_f_tail = (n, r)
-                break
-
-        if not target_f_tail and fixed_remainder == 0 and default_f_tail:
-            target_f_tail = default_f_tail
-
-        if target_f_tail:
-            n, r = target_f_tail
-            dx, dy, dz = dx_f_base, 0, dz_f_base
-            if default_f_tail and r != default_f_tail[1]:
-                def_r = default_f_tail[1]
-                dx += (def_r.x - r.x)
-                dy += (def_r.y - r.y)
-                dz += (def_r.z - r.z)
-            new_schem.regions[n] = clone_reg_dir(r, dx, dy, dz)
-
-        for n, r in moving_cycles:
-            new_schem.regions[n] = clone_reg_dir(r, 0, 0, 0)
-            for i in range(copies_m):
-                cdx, cdz = self.get_offset(params['moving_axis_dir'], (i + 1) * params['cycle_len_m'])
-                new_schem.regions[f"{n}_ext_{i + 1}"] = clone_reg_dir(r, cdx, 0, cdz)
-
-        target_m_tail = None
-        default_m_tail = None
-
-        for n, r in moving_tails:
-            match = re.search(r'\((\d+)\)', n)
-            if not match or int(match.group(1)) == 0:
-                default_m_tail = (n, r)
-                break
-
-        for n, r in moving_tails:
-            match = re.search(r'\((\d+)\)', n)
-            if match and int(match.group(1)) == moving_remainder:
-                target_m_tail = (n, r)
-                break
-
-        if not target_m_tail and moving_remainder == 0 and default_m_tail:
-            target_m_tail = default_m_tail
-
-        if target_m_tail:
-            n, r = target_m_tail
-            dx, dy, dz = dx_m, 0, dz_m
-            if default_m_tail and r != default_m_tail[1]:
-                def_r = default_m_tail[1]
-                dx += (def_r.x - r.x)
-                dy += (def_r.y - r.y)
-                dz += (def_r.z - r.z)
-            new_schem.regions[n] = clone_reg_dir(r, dx, dy, dz)
-
-        return new_schem
-
-    def export_extended_schematic(self):
-        if not self.latest_extended_schem:
-            return QMessageBox.warning(self, "错误", "请先等待拼装渲染完成！")
-
-        default_filename = f"{self.latest_extended_schem.name}.litematic"
-        out_file, _ = QFileDialog.getSaveFileName(self, "保存延长版投影", default_filename, "Litematica (*.litematic)")
-        if out_file:
-            try:
-                self.latest_extended_schem.save(ensure_litematic_extension(out_file))
-                QMessageBox.information(self, "成功", f"投影已成功拼接并导出！")
-            except Exception as e:
-                QMessageBox.critical(self, "导出失败", str(e))
-
     def manual_generate(self):
         try:
             seed = normalize_java_seed(self.manual_seed.text().strip())
@@ -4510,12 +3790,16 @@ class SlimeApp(QWidget):
                             self.chk_precise_afk.setChecked(bool(search_params["precise_afk"]))
                         if "scan_y" in search_params:
                             self.chk_scan_y.setChecked(bool(search_params["scan_y"]))
+                        if search_params.get("result_limit") is not None:
+                            self.config.result_limit = clamp_int(search_params.get("result_limit"), DEFAULT_RESULT_LIMIT, 1, MAX_RESULT_LIMIT)
                         saved_engine = search_params.get("engine")
                         if saved_engine:
                             engine_idx = self.engine_combo.findText(str(saved_engine))
                             if engine_idx >= 0:
                                 self.engine_combo.setCurrentIndex(engine_idx)
 
+                        self.top_50_results = data.get("ranked_results", [])
+                        self._refresh_rank_controls()
                         self.apply_projection_settings(data.get("projection", {}))
                         image_path = data.get('image', '')
                         if image_path and not os.path.isabs(image_path):
@@ -4589,7 +3873,7 @@ class SlimeApp(QWidget):
 
     def cleanup_runtime(self):
         self.c.cancel = True
-        for t in ['native_progress_timer', '_render_timer', '_floor_timer']:
+        for t in ['native_progress_timer', '_floor_timer']:
             if hasattr(self, t): getattr(self, t).stop()
         cleanup_native_resources()
         QPixmapCache.clear()
@@ -4646,6 +3930,7 @@ class SlimeApp(QWidget):
             self.config.min_search_radius = rd_min
             self.config.precise_afk = self.chk_precise_afk.isChecked()
             self.config.scan_y = self.chk_scan_y.isChecked()
+            self.config.result_limit = clamp_int(getattr(self.config, 'result_limit', DEFAULT_RESULT_LIMIT), DEFAULT_RESULT_LIMIT, 1, MAX_RESULT_LIMIT)
             self.config.selected_engine = self.engine_combo.currentText()
             self.config.save()
             choice = self.engine_combo.currentText()
@@ -4677,7 +3962,7 @@ class SlimeApp(QWidget):
                 self.native_progress_timer.stop()
             self.native_progress_timer.start()
             is_dd_checked = self.chk_dd.isChecked()
-            threading.Thread(target=run_full_logic, args=(self, seeds, rd_max, ms, max_s, self.config.use_range, rd_min, engine, self.config.precise_afk, self.config.scan_y, is_dd_checked), daemon=True).start()
+            threading.Thread(target=run_full_logic, args=(self, seeds, rd_max, ms, max_s, self.config.use_range, rd_min, engine, self.config.precise_afk, self.config.scan_y, self.config.result_limit, is_dd_checked), daemon=True).start()
         except ValueError as e:
             self.upd_log(f"输入错误: {e}")
             QMessageBox.warning(self, "输入错误", str(e))

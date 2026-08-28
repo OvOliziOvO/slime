@@ -297,7 +297,7 @@ __device__ __forceinline__ bool is_slime_fast_math_seeded_z_variant(
 }
 
 
-template <int STRIDE>
+template <int STRIDE, bool NO_UPPER>
 __device__ __forceinline__ int32_t circle_from_shared_ring(
     const uint32_t* rows, int32_t current_row,
     int32_t word, int32_t lane, int32_t square_score,
@@ -308,6 +308,7 @@ __device__ __forceinline__ int32_t circle_from_shared_ring(
     // all 221 included cells. Largest corner slices run first, allowing most
     // false square survivors to stop after only a few popcounts.
     int32_t exact = square_score;
+    #define V34_OUT_OF_RANGE(REM) (exact < min_size || (!NO_UPPER && exact - (REM) > max_size))
     #define V34_SUB_CORNERS(I, MDX) do { \
         const uint32_t* src = rows + (((current_row - 16 + (I)) & 31) * STRIDE); \
         const uint32_t bits17 = __funnelshift_r(src[word], src[word + 1], lane) & 0x1FFFFU; \
@@ -316,21 +317,22 @@ __device__ __forceinline__ int32_t circle_from_shared_ring(
         exact -= __popc(bits17 & corners); \
     } while (0)
     V34_SUB_CORNERS( 0, 2); V34_SUB_CORNERS(16, 2); // 24 cells
-    if (exact < min_size || exact - 44 > max_size) return exact;
+    if (V34_OUT_OF_RANGE(44)) return exact;
     V34_SUB_CORNERS( 1, 4); V34_SUB_CORNERS(15, 4); // 16 cells
-    if (exact < min_size || exact - 28 > max_size) return exact;
+    if (V34_OUT_OF_RANGE(28)) return exact;
     V34_SUB_CORNERS( 2, 5); V34_SUB_CORNERS(14, 5); // 12 cells
-    if (exact < min_size || exact - 16 > max_size) return exact;
+    if (V34_OUT_OF_RANGE(16)) return exact;
     V34_SUB_CORNERS( 3, 6); V34_SUB_CORNERS(13, 6); // 8 cells
-    if (exact < min_size || exact - 8 > max_size) return exact;
+    if (V34_OUT_OF_RANGE(8)) return exact;
     V34_SUB_CORNERS( 4, 7); V34_SUB_CORNERS( 5, 7);
     V34_SUB_CORNERS(11, 7); V34_SUB_CORNERS(12, 7); // 8 cells
     #undef V34_SUB_CORNERS
+    #undef V34_OUT_OF_RANGE
     return exact;
 }
 
 template <int TPB, int CPT, bool DENSE_COUNT, int RNG_MODE,
-          bool HAS_OLD, bool EMIT, bool FULL_X>
+          bool HAS_OLD, bool EMIT, bool FULL_X, bool NO_UPPER>
 __device__ __forceinline__ void fused_sparse_v34_row(
     uint32_t* rows,
     const uint64_t* __restrict__ seeded_z_terms,
@@ -373,16 +375,16 @@ __device__ __forceinline__ void fused_sparse_v34_row(
         }
         square_score[k] = square;
 
-        if (EMIT && square >= min_size && square <= max_size + 68) {
+        if (EMIT && square >= min_size && (NO_UPPER || square <= max_size + 68)) {
             const int32_t cx = base_x + x_base + (int32_t)threadIdx.x + k * TPB;
             const int32_t cz = slab_base_z + z_base + (r - 16);
             const int64_t cx64 = (int64_t)cx;
             const int64_t cz64 = (int64_t)cz;
             if (rd_min_sq != 0 && cx64 * cx64 + cz64 * cz64 < rd_min_sq)
                 continue;
-            const int32_t exact = circle_from_shared_ring<STRIDE>(
+            const int32_t exact = circle_from_shared_ring<STRIDE, NO_UPPER>(
                 rows, r, word, lane, square, min_size, max_size);
-            if (exact >= min_size && exact <= max_size) {
+            if (exact >= min_size && (NO_UPPER || exact <= max_size)) {
                 if constexpr (!DENSE_COUNT) {
                     const uint32_t out = atomicAdd(d_emitted_count, 1U);
                     if (out < (uint32_t)max_gpu_buffer) {
@@ -406,7 +408,7 @@ __device__ __forceinline__ void fused_sparse_v34_row(
     }
 }
 
-template <int TPB, int CPT, int BAND_H, bool DENSE_COUNT, int RNG_MODE>
+template <int TPB, int CPT, int BAND_H, bool DENSE_COUNT, int RNG_MODE, bool NO_UPPER>
 __global__ __launch_bounds__(TPB) void search_slime_fused_sparse_v34_kernel(
     const uint64_t* __restrict__ x_terms,
     const uint64_t* __restrict__ seeded_z_terms,
@@ -457,40 +459,40 @@ __global__ __launch_bounds__(TPB) void search_slime_fused_sparse_v34_kernel(
             xt[k] = x_terms[x_base + (input_active[k] ? x_local : 0)];
             square_score[k] = 0;
         }
-        __syncthreads();
-
+        // No barrier is needed here: the previous tile ends with a block barrier,
+        // and each row synchronizes immediately after publishing its ballots.
         if (tile_out_w == OUT_W) {
             for (int32_t r = 0; r < 16; ++r)
-                fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,true>(
+                fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,true,NO_UPPER>(
                     rows, seeded_z_terms, z_base, r, lane, warp,
                     xt, input_active, output_active, square_score,
                     min_size, max_size, emit_min_size, rd_min_sq, base_x, slab_base_z, x_base,
                     d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
-            fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,true>(
+            fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,true,NO_UPPER>(
                 rows, seeded_z_terms, z_base, 16, lane, warp,
                 xt, input_active, output_active, square_score,
                 min_size, max_size, emit_min_size, rd_min_sq, base_x, slab_base_z, x_base,
                 d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
             for (int32_t r = 17; r < tile_in_h; ++r)
-                fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,true>(
+                fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,true,NO_UPPER>(
                     rows, seeded_z_terms, z_base, r, lane, warp,
                     xt, input_active, output_active, square_score,
                     min_size, max_size, emit_min_size, rd_min_sq, base_x, slab_base_z, x_base,
                     d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
         } else {
             for (int32_t r = 0; r < 16; ++r)
-                fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,false>(
+                fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,false,NO_UPPER>(
                     rows, seeded_z_terms, z_base, r, lane, warp,
                     xt, input_active, output_active, square_score,
                     min_size, max_size, emit_min_size, rd_min_sq, base_x, slab_base_z, x_base,
                     d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
-            fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,false>(
+            fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,false,NO_UPPER>(
                 rows, seeded_z_terms, z_base, 16, lane, warp,
                 xt, input_active, output_active, square_score,
                 min_size, max_size, emit_min_size, rd_min_sq, base_x, slab_base_z, x_base,
                 d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
             for (int32_t r = 17; r < tile_in_h; ++r)
-                fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,false>(
+                fused_sparse_v34_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,false,NO_UPPER>(
                     rows, seeded_z_terms, z_base, r, lane, warp,
                     xt, input_active, output_active, square_score,
                     min_size, max_size, emit_min_size, rd_min_sq, base_x, slab_base_z, x_base,
@@ -1002,19 +1004,23 @@ extern "C" {
                               int32_t launch_width, int32_t launch_height,
                               int32_t launch_tiles_x, int32_t launch_tiles_z,
                               int32_t launch_blocks, int32_t emit_min_size) -> cudaError_t {
-            #define LAUNCH_V34_SHAPE(T, C, R) do { \
+            #define LAUNCH_V34_SHAPE_IMPL(T, C, R, N) do { \
                 if (emit_min_size > min_size) \
-                    search_slime_fused_sparse_v34_kernel<T, C, BAND_H, true, R><<<launch_blocks, T>>>( \
+                    search_slime_fused_sparse_v34_kernel<T, C, BAND_H, true, R, N><<<launch_blocks, T>>>( \
                         d_x_terms, d_z_terms + launch_z_offset, \
                         base_x, base_z + launch_z_offset, launch_width, launch_height, \
                         launch_tiles_x, launch_tiles_z, min_size, max_size, emit_min_size, rd_min_sq, \
                         d_results, gpu_buffer_cap, d_found_count, d_emitted_count); \
                 else \
-                    search_slime_fused_sparse_v34_kernel<T, C, BAND_H, false, R><<<launch_blocks, T>>>( \
+                    search_slime_fused_sparse_v34_kernel<T, C, BAND_H, false, R, N><<<launch_blocks, T>>>( \
                         d_x_terms, d_z_terms + launch_z_offset, \
                         base_x, base_z + launch_z_offset, launch_width, launch_height, \
                         launch_tiles_x, launch_tiles_z, min_size, max_size, emit_min_size, rd_min_sq, \
                         d_results, gpu_buffer_cap, d_found_count, d_emitted_count); \
+            } while (0)
+            #define LAUNCH_V34_SHAPE(T, C, R) do { \
+                if (max_size >= 221) LAUNCH_V34_SHAPE_IMPL(T, C, R, true); \
+                else LAUNCH_V34_SHAPE_IMPL(T, C, R, false); \
             } while (0)
             if (rng_variant == 2) {
                 if (shape == 1) LAUNCH_V34_SHAPE(128, 8, 2);
@@ -1033,6 +1039,7 @@ extern "C" {
                 else LAUNCH_V34_SHAPE(256, 4, 0);
             }
             #undef LAUNCH_V34_SHAPE
+            #undef LAUNCH_V34_SHAPE_IMPL
             return cudaGetLastError();
         };
 
