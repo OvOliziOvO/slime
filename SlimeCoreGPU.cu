@@ -608,6 +608,1932 @@ __global__ __launch_bounds__(TPB) void search_slime_fused_sparse_v1_kernel(
     }
 }
 
+template <int STRIDE>
+__device__ __forceinline__ int32_t group2_circle(
+    const uint32_t* rows, int32_t r, int32_t word, int32_t shift, int32_t dz
+) {
+    constexpr int mdx[17] = {2,4,5,6,7,7,8,8,8,8,8,7,7,6,5,4,2};
+    int32_t total = 0;
+    #pragma unroll
+    for (int i=0;i<17;++i) {
+        const uint32_t* row=rows+(((r-17+dz+i)&31)*STRIDE);
+        const uint32_t bits=__funnelshift_r(row[word],row[word+1],shift);
+        const uint32_t mask=((1U<<(2*mdx[i]+1))-1U)<<(8-mdx[i]);
+        total+=__popc(bits&mask);
+    }
+    return total;
+}
+template <int TPB, int CPT, bool DENSE_COUNT, int RNG_MODE,
+          bool HAS_OLD, bool EMIT, bool FULL_X, bool NO_UPPER>
+__device__ __forceinline__ void fused_sparse_v1_group2_row(
+    uint32_t* rows, const uint64_t* __restrict__ seeded_z_terms,
+    int32_t z_base, int32_t r, int32_t lane, int32_t warp,
+    const uint64_t (&xt)[CPT], const bool (&input_active)[CPT],
+    const bool (&output_active)[CPT], int32_t (&square_score)[CPT/2],
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z, int32_t x_base,
+    int32_t tile_out_w, int32_t tile_out_h,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    uint32_t& thread_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int WARPS=TPB/32,WORDS=WARPS*CPT,STRIDE=((WORDS+4)/4)*4;
+    const int32_t slot=r&31;
+    const uint64_t zt=seeded_z_terms[z_base+r];
+    uint32_t ballots[CPT];
+    #pragma unroll
+    for(int k=0;k<CPT;++k) {
+        const bool slime=(FULL_X||input_active[k])&&is_slime_fast_math_seeded_z_variant<RNG_MODE>(xt[k],zt);
+        ballots[k]=__ballot_sync(0xffffffffU,slime);
+    }
+    if(lane==0) {
+        #pragma unroll
+        for(int q=0;q<CPT;q+=4) {
+            uint4 p={ballots[q],ballots[q+1],ballots[q+2],ballots[q+3]};
+            *reinterpret_cast<uint4*>(rows+slot*STRIDE+warp*CPT+q)=p;
+        }
+    }
+    __syncthreads();
+    const uint32_t* newest_row=rows+slot*STRIDE;
+    const uint32_t* oldest_row=rows+((r+14)&31)*STRIDE;
+    #pragma unroll
+    for(int k=0;k<CPT/2;++k) {
+        const int32_t gx=(warp*CPT+2*k)*32+lane*2;
+        if(gx>=tile_out_w)continue;
+        const int32_t word=warp*CPT+2*k+(lane>>4);
+        const int32_t shift=(lane&15)*2;
+        const uint32_t left=lane<16?ballots[2*k]:ballots[2*k+1];
+        uint32_t right;
+        if(2*k+2<CPT)right=lane<16?ballots[2*k+1]:ballots[2*k+2];
+        else right=lane<16?ballots[2*k+1]:newest_row[warp*CPT+CPT];
+        int32_t score=square_score[k]+__popc(__funnelshift_r(left,right,shift)&0x3ffffU);
+        if(HAS_OLD)score-=__popc(__funnelshift_r(oldest_row[word],oldest_row[word+1],shift)&0x3ffffU);
+        square_score[k]=score;
+        if(EMIT&&(r&1)&&score>=min_size) {
+            #pragma unroll
+            for(int dz=0;dz<2;++dz) {
+                if(r-17+dz>=tile_out_h)continue;
+                #pragma unroll
+                for(int dx=0;dx<2;++dx) {
+                    if(gx+dx>=tile_out_w)continue;
+                    const int32_t cx=base_x+x_base+gx+dx;
+                    const int32_t cz=slab_base_z+z_base+r-17+dz;
+                    const int64_t ddx=(int64_t)cx-search_center_x,ddz=(int64_t)cz-search_center_z;
+                    if(rd_min_sq&&ddx*ddx+ddz*ddz<rd_min_sq)continue;
+                    const int32_t exact=group2_circle<STRIDE>(rows,r,word,shift+dx,dz);
+                    if(exact>=min_size&&(NO_UPPER||exact<=max_size)) {
+                        if constexpr(DENSE_COUNT)++thread_found_count;
+                        if(!DENSE_COUNT||exact>=emit_min_size) {
+                            const auto out=atomicAdd(d_emitted_count,1ULL);
+                            if(out<(unsigned long long)max_gpu_buffer) {
+                                d_results[out].size=exact;
+                                d_results[out].center_x=cx*16+8;
+                                d_results[out].center_z=cz*16+8;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+template <int TPB, int CPT, int BAND_H, bool DENSE_COUNT, int RNG_MODE, bool NO_UPPER>
+__global__ __launch_bounds__(TPB) void search_slime_group2_kernel(
+    const uint64_t* __restrict__ x_terms,
+    const uint64_t* __restrict__ seeded_z_terms,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z,
+    int32_t out_width, int32_t out_height,
+    int32_t tiles_x, int32_t tiles_z,
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    unsigned long long* d_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int TILE_W = TPB * CPT;
+    constexpr int OUT_W = TILE_W - 16;
+    constexpr int WARPS = TPB / 32;
+    constexpr int WORDS = WARPS * CPT;
+    constexpr int STRIDE = ((WORDS + 4) / 4) * 4;
+    __shared__ __align__(16) uint32_t rows[32 * STRIDE];
+    __shared__ uint32_t block_found_count;
+
+    const int32_t tx = (int32_t)threadIdx.x;
+    const int32_t lane = tx & 31;
+    const int32_t warp = tx >> 5;
+    uint32_t thread_found_count = 0U;
+    if (tx == 0) block_found_count = 0U;
+    if (tx < 32) rows[tx * STRIDE + WORDS] = 0U;
+    __syncthreads();
+
+    const int64_t total_tiles = (int64_t)tiles_x * (int64_t)tiles_z;
+    for (int64_t tile = (int64_t)blockIdx.x; tile < total_tiles;
+         tile += (int64_t)gridDim.x) {
+        const int32_t tile_x = (int32_t)(tile % tiles_x);
+        const int32_t tile_z = (int32_t)(tile / tiles_x);
+        const int32_t x_base = tile_x * OUT_W;
+        const int32_t z_base = tile_z * BAND_H;
+        const int32_t tile_out_w = min(OUT_W, out_width - x_base);
+        const int32_t tile_out_h = min(BAND_H, out_height - z_base);
+        const int32_t tile_in_w = tile_out_w + 16 + (tile_out_w & 1);
+        const int32_t tile_in_h = tile_out_h + 16 + (tile_out_h & 1);
+
+        uint64_t xt[CPT];
+        bool input_active[CPT];
+        bool output_active[CPT];
+        int32_t square_score[CPT/2];
+        #pragma unroll
+        for (int k = 0; k < CPT; ++k) {
+            const int32_t x_local = (warp * CPT + k) * 32 + lane;
+            input_active[k] = x_local < tile_in_w;
+            output_active[k] = x_local < tile_out_w;
+            xt[k] = x_terms[x_base + (input_active[k] ? x_local : 0)];
+            if (k < CPT/2) square_score[k] = 0;
+        }
+        // No barrier is needed here: the previous tile ends with a block barrier,
+        // and each row synchronizes immediately after publishing its ballots.
+        if (tile_out_w == OUT_W) {
+            for (int32_t r = 0; r < 17; ++r)
+                fused_sparse_v1_group2_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,true,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_sparse_v1_group2_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,true,NO_UPPER>(
+                rows, seeded_z_terms, z_base, 17, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 18; r < tile_in_h; ++r)
+                fused_sparse_v1_group2_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,true,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        } else {
+            for (int32_t r = 0; r < 17; ++r)
+                fused_sparse_v1_group2_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,false,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_sparse_v1_group2_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,false,NO_UPPER>(
+                rows, seeded_z_terms, z_base, 17, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 18; r < tile_in_h; ++r)
+                fused_sparse_v1_group2_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,false,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+    if constexpr (DENSE_COUNT) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            thread_found_count += __shfl_down_sync(0xFFFFFFFFU, thread_found_count, offset);
+        if (lane == 0) atomicAdd(&block_found_count, thread_found_count);
+        __syncthreads();
+        if (tx == 0 && block_found_count != 0U)
+            atomicAdd(d_found_count, (unsigned long long)block_found_count);
+    }
+}
+
+template <int STRIDE>
+__device__ __forceinline__ int32_t group4_row20(
+    const uint32_t* rows, int32_t row, int32_t word, int32_t shift
+) {
+    const uint32_t* src=rows+((row&31)*STRIDE);
+    return __popc(__funnelshift_r(src[word],src[word+1],shift)&0xfffffU);
+}
+template <int STRIDE>
+__device__ __forceinline__ int32_t group4_circle(
+    const uint32_t* rows, int32_t r, int32_t word, int32_t shift, int32_t dz
+) {
+    constexpr int mdx[17]={2,4,5,6,7,7,8,8,8,8,8,7,7,6,5,4,2};
+    int32_t total=0;
+    #pragma unroll
+    for(int i=0;i<17;++i) {
+        const uint32_t* src=rows+(((r-19+dz+i)&31)*STRIDE);
+        const uint32_t mask=((1U<<(2*mdx[i]+1))-1U)<<(8-mdx[i]);
+        total+=__popc(__funnelshift_r(src[word],src[word+1],shift)&mask);
+    }
+    return total;
+}
+template <int TPB, int CPT, bool DENSE_COUNT, int RNG_MODE,
+          bool HAS_OLD, bool EMIT, bool FULL_X, bool NO_UPPER>
+__device__ __forceinline__ void fused_sparse_v1_group4_row(
+    uint32_t* rows, const uint64_t* __restrict__ seeded_z_terms,
+    int32_t z_base, int32_t r, int32_t lane, int32_t warp,
+    const uint64_t (&xt)[CPT], const bool (&input_active)[CPT],
+    const bool (&output_active)[CPT], int32_t (&square_score)[CPT/4],
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z, int32_t x_base,
+    int32_t tile_out_w, int32_t tile_out_h,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    uint32_t& thread_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int WARPS=TPB/32,WORDS=WARPS*CPT,STRIDE=((WORDS+4)/4)*4;
+    const uint64_t zt=seeded_z_terms[z_base+r];
+    uint32_t ballots[CPT];
+    #pragma unroll
+    for(int k=0;k<CPT;++k)
+        ballots[k]=__ballot_sync(0xffffffffU,(FULL_X||input_active[k])&&
+            is_slime_fast_math_seeded_z_variant<RNG_MODE>(xt[k],zt));
+    if(lane==0) {
+        #pragma unroll
+        for(int q=0;q<CPT;q+=4) {
+            uint4 packed={ballots[q],ballots[q+1],ballots[q+2],ballots[q+3]};
+            *reinterpret_cast<uint4*>(rows+(r&31)*STRIDE+warp*CPT+q)=packed;
+        }
+    }
+    __syncthreads();
+    const uint32_t* new_row=rows+(r&31)*STRIDE;
+    const uint32_t* old_row=rows+((r+12)&31)*STRIDE;
+    #pragma unroll
+    for(int k=0;k<CPT/4;++k) {
+        const int32_t gx=(warp*CPT+4*k)*32+lane*4;
+        if(gx>=tile_out_w)continue;
+        const int32_t word=warp*CPT+4*k+(lane>>3),shift=(lane&7)*4;
+        const uint32_t left=lane<8?ballots[4*k]:
+            lane<16?ballots[4*k+1]:lane<24?ballots[4*k+2]:ballots[4*k+3];
+        uint32_t beyond;
+        if(4*k+4<CPT)beyond=ballots[4*k+4];
+        else beyond=new_row[warp*CPT+CPT];
+        const uint32_t right=lane<8?ballots[4*k+1]:
+            lane<16?ballots[4*k+2]:lane<24?ballots[4*k+3]:beyond;
+        int32_t score=square_score[k]+__popc(__funnelshift_r(left,right,shift)&0xfffffU);
+        if(HAS_OLD)score-=__popc(__funnelshift_r(old_row[word],old_row[word+1],shift)&0xfffffU);
+        square_score[k]=score;
+        if(EMIT&&((r&3)==3)&&score>=min_size) {
+            // Four 20x17 strips are strict bounds for each row of four circles.
+            const int32_t top0=group4_row20<STRIDE>(rows,r-19,word,shift);
+            const int32_t top1=group4_row20<STRIDE>(rows,r-18,word,shift);
+            const int32_t top2=group4_row20<STRIDE>(rows,r-17,word,shift);
+            const int32_t bot0=group4_row20<STRIDE>(rows,r-2,word,shift);
+            const int32_t bot1=group4_row20<STRIDE>(rows,r-1,word,shift);
+            const int32_t bot2=group4_row20<STRIDE>(rows,r,word,shift);
+            int32_t strip=score-bot0-bot1-bot2;
+            #pragma unroll 1
+            for(int dz=0;dz<4;++dz) {
+                if(r-19+dz<tile_out_h&&strip>=min_size) {
+                    #pragma unroll 1
+                    for(int dx=0;dx<4;++dx) {
+                        if(gx+dx>=tile_out_w)continue;
+                        const int32_t cx=base_x+x_base+gx+dx;
+                        const int32_t cz=slab_base_z+z_base+r-19+dz;
+                        const int64_t ddx=(int64_t)cx-search_center_x,ddz=(int64_t)cz-search_center_z;
+                        if(rd_min_sq&&ddx*ddx+ddz*ddz<rd_min_sq)continue;
+                        const int32_t exact=group4_circle<STRIDE>(rows,r,word,shift+dx,dz);
+                        if(exact>=min_size&&(NO_UPPER||exact<=max_size)) {
+                            if constexpr(DENSE_COUNT)++thread_found_count;
+                            if(!DENSE_COUNT||exact>=emit_min_size) {
+                                const auto out=atomicAdd(d_emitted_count,1ULL);
+                                if(out<(unsigned long long)max_gpu_buffer) {
+                                    d_results[out].size=exact;
+                                    d_results[out].center_x=cx*16+8;
+                                    d_results[out].center_z=cz*16+8;
+                                }
+                            }
+                        }
+                    }
+                }
+                if(dz==0)strip+=bot0-top0;
+                else if(dz==1)strip+=bot1-top1;
+                else if(dz==2)strip+=bot2-top2;
+            }
+        }
+    }
+}
+template <int TPB, int CPT, int BAND_H, bool DENSE_COUNT, int RNG_MODE, bool NO_UPPER>
+__global__ __launch_bounds__(TPB) void search_slime_group4_kernel(
+    const uint64_t* __restrict__ x_terms,
+    const uint64_t* __restrict__ seeded_z_terms,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z,
+    int32_t out_width, int32_t out_height,
+    int32_t tiles_x, int32_t tiles_z,
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    unsigned long long* d_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int TILE_W = TPB * CPT;
+    constexpr int OUT_W = TILE_W - 16;
+    constexpr int WARPS = TPB / 32;
+    constexpr int WORDS = WARPS * CPT;
+    constexpr int STRIDE = ((WORDS + 4) / 4) * 4;
+    __shared__ __align__(16) uint32_t rows[32 * STRIDE];
+    __shared__ uint32_t block_found_count;
+
+    const int32_t tx = (int32_t)threadIdx.x;
+    const int32_t lane = tx & 31;
+    const int32_t warp = tx >> 5;
+    uint32_t thread_found_count = 0U;
+    if (tx == 0) block_found_count = 0U;
+    if (tx < 32) rows[tx * STRIDE + WORDS] = 0U;
+    __syncthreads();
+
+    const int64_t total_tiles = (int64_t)tiles_x * (int64_t)tiles_z;
+    for (int64_t tile = (int64_t)blockIdx.x; tile < total_tiles;
+         tile += (int64_t)gridDim.x) {
+        const int32_t tile_x = (int32_t)(tile % tiles_x);
+        const int32_t tile_z = (int32_t)(tile / tiles_x);
+        const int32_t x_base = tile_x * OUT_W;
+        const int32_t z_base = tile_z * BAND_H;
+        const int32_t tile_out_w = min(OUT_W, out_width - x_base);
+        const int32_t tile_out_h = min(BAND_H, out_height - z_base);
+        const int32_t tile_in_w = tile_out_w + 16 + ((4 - (tile_out_w & 3)) & 3);
+        const int32_t tile_in_h = tile_out_h + 16 + ((4 - (tile_out_h & 3)) & 3);
+
+        uint64_t xt[CPT];
+        bool input_active[CPT];
+        bool output_active[CPT];
+        int32_t square_score[CPT/4];
+        #pragma unroll
+        for (int k = 0; k < CPT; ++k) {
+            const int32_t x_local = (warp * CPT + k) * 32 + lane;
+            input_active[k] = x_local < tile_in_w;
+            output_active[k] = x_local < tile_out_w;
+            xt[k] = x_terms[x_base + (input_active[k] ? x_local : 0)];
+            if (k < CPT/4) square_score[k] = 0;
+        }
+        // No barrier is needed here: the previous tile ends with a block barrier,
+        // and each row synchronizes immediately after publishing its ballots.
+        if (tile_out_w == OUT_W) {
+            for (int32_t r = 0; r < 19; ++r)
+                fused_sparse_v1_group4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,true,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_sparse_v1_group4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,true,NO_UPPER>(
+                rows, seeded_z_terms, z_base, 19, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 20; r < tile_in_h; ++r)
+                fused_sparse_v1_group4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,true,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        } else {
+            for (int32_t r = 0; r < 19; ++r)
+                fused_sparse_v1_group4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,false,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_sparse_v1_group4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,false,NO_UPPER>(
+                rows, seeded_z_terms, z_base, 19, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 20; r < tile_in_h; ++r)
+                fused_sparse_v1_group4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,false,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+    if constexpr (DENSE_COUNT) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            thread_found_count += __shfl_down_sync(0xFFFFFFFFU, thread_found_count, offset);
+        if (lane == 0) atomicAdd(&block_found_count, thread_found_count);
+        __syncthreads();
+        if (tx == 0 && block_found_count != 0U)
+            atomicAdd(d_found_count, (unsigned long long)block_found_count);
+    }
+}
+template <int TPB, int CPT, bool DENSE_COUNT, int RNG_MODE,
+          bool HAS_OLD, bool EMIT, bool FULL_X, bool NO_UPPER>
+__device__ __forceinline__ void fused_sparse_v1_batch4_row(
+    uint32_t* rows, const uint64_t* __restrict__ seeded_z_terms,
+    int32_t z_base, int32_t r, int32_t lane, int32_t warp,
+    const uint64_t (&xt)[CPT], const bool (&input_active)[CPT],
+    const bool (&output_active)[CPT], int32_t (&square_score)[CPT/4],
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z, int32_t x_base,
+    int32_t tile_out_w, int32_t tile_out_h,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    uint32_t& thread_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int WARPS=TPB/32,WORDS=WARPS*CPT,STRIDE=((WORDS+4)/4)*4;
+    #pragma unroll 1
+    for(int j=0;j<4;++j) {
+    const uint64_t zt=seeded_z_terms[z_base+r-3+j];
+    uint32_t ballots[CPT];
+    #pragma unroll
+    for(int k=0;k<CPT;++k)
+        ballots[k]=__ballot_sync(0xffffffffU,(FULL_X||input_active[k])&&
+            is_slime_fast_math_seeded_z_variant<RNG_MODE>(xt[k],zt));
+    if(lane==0) {
+        #pragma unroll
+        for(int q=0;q<CPT;q+=4) {
+            uint4 packed={ballots[q],ballots[q+1],ballots[q+2],ballots[q+3]};
+            *reinterpret_cast<uint4*>(rows+((r-3+j)&31)*STRIDE+warp*CPT+q)=packed;
+        }
+    }
+    }
+    __syncthreads();
+    #pragma unroll
+    for(int k=0;k<CPT/4;++k) {
+        const int32_t gx=(warp*CPT+4*k)*32+lane*4;
+        if(gx>=tile_out_w)continue;
+        const int32_t word=warp*CPT+4*k+(lane>>3),shift=(lane&7)*4;
+        int32_t score=square_score[k];
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            score+=group4_row20<STRIDE>(rows,r-j,word,shift);
+            if(HAS_OLD)score-=group4_row20<STRIDE>(rows,r-j-20,word,shift);
+        }
+        square_score[k]=score;
+        if(EMIT&&score>=min_size) {
+            // Four 20x17 strips are strict bounds for each row of four circles.
+            const int32_t top0=group4_row20<STRIDE>(rows,r-19,word,shift);
+            const int32_t top1=group4_row20<STRIDE>(rows,r-18,word,shift);
+            const int32_t top2=group4_row20<STRIDE>(rows,r-17,word,shift);
+            const int32_t bot0=group4_row20<STRIDE>(rows,r-2,word,shift);
+            const int32_t bot1=group4_row20<STRIDE>(rows,r-1,word,shift);
+            const int32_t bot2=group4_row20<STRIDE>(rows,r,word,shift);
+            int32_t strip=score-bot0-bot1-bot2;
+            #pragma unroll 1
+            for(int dz=0;dz<4;++dz) {
+                if(r-19+dz<tile_out_h&&strip>=min_size) {
+                    #pragma unroll 1
+                    for(int dx=0;dx<4;++dx) {
+                        if(gx+dx>=tile_out_w)continue;
+                        const int32_t cx=base_x+x_base+gx+dx;
+                        const int32_t cz=slab_base_z+z_base+r-19+dz;
+                        const int64_t ddx=(int64_t)cx-search_center_x,ddz=(int64_t)cz-search_center_z;
+                        if(rd_min_sq&&ddx*ddx+ddz*ddz<rd_min_sq)continue;
+                        const int32_t exact=group4_circle<STRIDE>(rows,r,word,shift+dx,dz);
+                        if(exact>=min_size&&(NO_UPPER||exact<=max_size)) {
+                            if constexpr(DENSE_COUNT)++thread_found_count;
+                            if(!DENSE_COUNT||exact>=emit_min_size) {
+                                const auto out=atomicAdd(d_emitted_count,1ULL);
+                                if(out<(unsigned long long)max_gpu_buffer) {
+                                    d_results[out].size=exact;
+                                    d_results[out].center_x=cx*16+8;
+                                    d_results[out].center_z=cz*16+8;
+                                }
+                            }
+                        }
+                    }
+                }
+                if(dz==0)strip+=bot0-top0;
+                else if(dz==1)strip+=bot1-top1;
+                else if(dz==2)strip+=bot2-top2;
+            }
+        }
+    }
+}
+template <int TPB, int CPT, int BAND_H, bool DENSE_COUNT, int RNG_MODE, bool NO_UPPER>
+__global__ __launch_bounds__(TPB) void search_slime_batch4_kernel(
+    const uint64_t* __restrict__ x_terms,
+    const uint64_t* __restrict__ seeded_z_terms,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z,
+    int32_t out_width, int32_t out_height,
+    int32_t tiles_x, int32_t tiles_z,
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    unsigned long long* d_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int TILE_W = TPB * CPT;
+    constexpr int OUT_W = TILE_W - 16;
+    constexpr int WARPS = TPB / 32;
+    constexpr int WORDS = WARPS * CPT;
+    constexpr int STRIDE = ((WORDS + 4) / 4) * 4;
+    __shared__ __align__(16) uint32_t rows[32 * STRIDE];
+    __shared__ uint32_t block_found_count;
+
+    const int32_t tx = (int32_t)threadIdx.x;
+    const int32_t lane = tx & 31;
+    const int32_t warp = tx >> 5;
+    uint32_t thread_found_count = 0U;
+    if (tx == 0) block_found_count = 0U;
+    if (tx < 32) rows[tx * STRIDE + WORDS] = 0U;
+    __syncthreads();
+
+    const int64_t total_tiles = (int64_t)tiles_x * (int64_t)tiles_z;
+    for (int64_t tile = (int64_t)blockIdx.x; tile < total_tiles;
+         tile += (int64_t)gridDim.x) {
+        const int32_t tile_x = (int32_t)(tile % tiles_x);
+        const int32_t tile_z = (int32_t)(tile / tiles_x);
+        const int32_t x_base = tile_x * OUT_W;
+        const int32_t z_base = tile_z * BAND_H;
+        const int32_t tile_out_w = min(OUT_W, out_width - x_base);
+        const int32_t tile_out_h = min(BAND_H, out_height - z_base);
+        const int32_t tile_in_w = tile_out_w + 16 + ((4 - (tile_out_w & 3)) & 3);
+        const int32_t tile_in_h = tile_out_h + 16 + ((4 - (tile_out_h & 3)) & 3);
+
+        uint64_t xt[CPT];
+        bool input_active[CPT];
+        bool output_active[CPT];
+        int32_t square_score[CPT/4];
+        #pragma unroll
+        for (int k = 0; k < CPT; ++k) {
+            const int32_t x_local = (warp * CPT + k) * 32 + lane;
+            input_active[k] = x_local < tile_in_w;
+            output_active[k] = x_local < tile_out_w;
+            xt[k] = x_terms[x_base + (input_active[k] ? x_local : 0)];
+            if (k < CPT/4) square_score[k] = 0;
+        }
+        // No barrier is needed here: the previous tile ends with a block barrier,
+        // and each row synchronizes immediately after publishing its ballots.
+        if (tile_out_w == OUT_W) {
+            for (int32_t r = 3; r < 19; r += 4)
+                fused_sparse_v1_batch4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,true,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_sparse_v1_batch4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,true,NO_UPPER>(
+                rows, seeded_z_terms, z_base, 19, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 23; r < tile_in_h; r += 4)
+                fused_sparse_v1_batch4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,true,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        } else {
+            for (int32_t r = 3; r < 19; r += 4)
+                fused_sparse_v1_batch4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,false,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_sparse_v1_batch4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,false,NO_UPPER>(
+                rows, seeded_z_terms, z_base, 19, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 23; r < tile_in_h; r += 4)
+                fused_sparse_v1_batch4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,false,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+    if constexpr (DENSE_COUNT) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            thread_found_count += __shfl_down_sync(0xFFFFFFFFU, thread_found_count, offset);
+        if (lane == 0) atomicAdd(&block_found_count, thread_found_count);
+        __syncthreads();
+        if (tx == 0 && block_found_count != 0U)
+            atomicAdd(d_found_count, (unsigned long long)block_found_count);
+    }
+}
+template <int TPB, int CPT, bool DENSE_COUNT, int RNG_MODE,
+          bool HAS_OLD, bool EMIT, bool FULL_X, bool NO_UPPER>
+__device__ __forceinline__ void fused_sparse_v1_unroll4_row(
+    uint32_t* rows, const uint64_t* __restrict__ seeded_z_terms,
+    int32_t z_base, int32_t r, int32_t lane, int32_t warp,
+    const uint64_t (&xt)[CPT], const bool (&input_active)[CPT],
+    const bool (&output_active)[CPT], int32_t (&square_score)[CPT/4],
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z, int32_t x_base,
+    int32_t tile_out_w, int32_t tile_out_h,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    uint32_t& thread_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int WARPS=TPB/32,WORDS=WARPS*CPT,STRIDE=((WORDS+4)/4)*4;
+    #pragma unroll 4
+    for(int j=0;j<4;++j) {
+    const uint64_t zt=seeded_z_terms[z_base+r-3+j];
+    uint32_t ballots[CPT];
+    #pragma unroll
+    for(int k=0;k<CPT;++k)
+        ballots[k]=__ballot_sync(0xffffffffU,(FULL_X||input_active[k])&&
+            is_slime_fast_math_seeded_z_variant<RNG_MODE>(xt[k],zt));
+    if(lane==0) {
+        #pragma unroll
+        for(int q=0;q<CPT;q+=4) {
+            uint4 packed={ballots[q],ballots[q+1],ballots[q+2],ballots[q+3]};
+            *reinterpret_cast<uint4*>(rows+((r-3+j)&31)*STRIDE+warp*CPT+q)=packed;
+        }
+    }
+    }
+    __syncthreads();
+    #pragma unroll
+    for(int k=0;k<CPT/4;++k) {
+        const int32_t gx=(warp*CPT+4*k)*32+lane*4;
+        if(gx>=tile_out_w)continue;
+        const int32_t word=warp*CPT+4*k+(lane>>3),shift=(lane&7)*4;
+        int32_t score=square_score[k];
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            score+=group4_row20<STRIDE>(rows,r-j,word,shift);
+            if(HAS_OLD)score-=group4_row20<STRIDE>(rows,r-j-20,word,shift);
+        }
+        square_score[k]=score;
+        if(EMIT&&score>=min_size) {
+            // Four 20x17 strips are strict bounds for each row of four circles.
+            const int32_t top0=group4_row20<STRIDE>(rows,r-19,word,shift);
+            const int32_t top1=group4_row20<STRIDE>(rows,r-18,word,shift);
+            const int32_t top2=group4_row20<STRIDE>(rows,r-17,word,shift);
+            const int32_t bot0=group4_row20<STRIDE>(rows,r-2,word,shift);
+            const int32_t bot1=group4_row20<STRIDE>(rows,r-1,word,shift);
+            const int32_t bot2=group4_row20<STRIDE>(rows,r,word,shift);
+            int32_t strip=score-bot0-bot1-bot2;
+            #pragma unroll 1
+            for(int dz=0;dz<4;++dz) {
+                if(r-19+dz<tile_out_h&&strip>=min_size) {
+                    #pragma unroll 1
+                    for(int dx=0;dx<4;++dx) {
+                        if(gx+dx>=tile_out_w)continue;
+                        const int32_t cx=base_x+x_base+gx+dx;
+                        const int32_t cz=slab_base_z+z_base+r-19+dz;
+                        const int64_t ddx=(int64_t)cx-search_center_x,ddz=(int64_t)cz-search_center_z;
+                        if(rd_min_sq&&ddx*ddx+ddz*ddz<rd_min_sq)continue;
+                        const int32_t exact=group4_circle<STRIDE>(rows,r,word,shift+dx,dz);
+                        if(exact>=min_size&&(NO_UPPER||exact<=max_size)) {
+                            if constexpr(DENSE_COUNT)++thread_found_count;
+                            if(!DENSE_COUNT||exact>=emit_min_size) {
+                                const auto out=atomicAdd(d_emitted_count,1ULL);
+                                if(out<(unsigned long long)max_gpu_buffer) {
+                                    d_results[out].size=exact;
+                                    d_results[out].center_x=cx*16+8;
+                                    d_results[out].center_z=cz*16+8;
+                                }
+                            }
+                        }
+                    }
+                }
+                if(dz==0)strip+=bot0-top0;
+                else if(dz==1)strip+=bot1-top1;
+                else if(dz==2)strip+=bot2-top2;
+            }
+        }
+    }
+}
+template <int TPB, int CPT, int BAND_H, bool DENSE_COUNT, int RNG_MODE, bool NO_UPPER>
+__global__ __launch_bounds__(TPB, 1024 / TPB) void search_slime_unroll4_cap64_kernel(
+    const uint64_t* __restrict__ x_terms,
+    const uint64_t* __restrict__ seeded_z_terms,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z,
+    int32_t out_width, int32_t out_height,
+    int32_t tiles_x, int32_t tiles_z,
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    unsigned long long* d_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int TILE_W = TPB * CPT;
+    constexpr int OUT_W = TILE_W - 16;
+    constexpr int WARPS = TPB / 32;
+    constexpr int WORDS = WARPS * CPT;
+    constexpr int STRIDE = ((WORDS + 4) / 4) * 4;
+    __shared__ __align__(16) uint32_t rows[32 * STRIDE];
+    __shared__ uint32_t block_found_count;
+
+    const int32_t tx = (int32_t)threadIdx.x;
+    const int32_t lane = tx & 31;
+    const int32_t warp = tx >> 5;
+    uint32_t thread_found_count = 0U;
+    if (tx == 0) block_found_count = 0U;
+    if (tx < 32) rows[tx * STRIDE + WORDS] = 0U;
+    __syncthreads();
+
+    const int64_t total_tiles = (int64_t)tiles_x * (int64_t)tiles_z;
+    for (int64_t tile = (int64_t)blockIdx.x; tile < total_tiles;
+         tile += (int64_t)gridDim.x) {
+        const int32_t tile_x = (int32_t)(tile % tiles_x);
+        const int32_t tile_z = (int32_t)(tile / tiles_x);
+        const int32_t x_base = tile_x * OUT_W;
+        const int32_t z_base = tile_z * BAND_H;
+        const int32_t tile_out_w = min(OUT_W, out_width - x_base);
+        const int32_t tile_out_h = min(BAND_H, out_height - z_base);
+        const int32_t tile_in_w = tile_out_w + 16 + ((4 - (tile_out_w & 3)) & 3);
+        const int32_t tile_in_h = tile_out_h + 16 + ((4 - (tile_out_h & 3)) & 3);
+
+        uint64_t xt[CPT];
+        bool input_active[CPT];
+        bool output_active[CPT];
+        int32_t square_score[CPT/4];
+        #pragma unroll
+        for (int k = 0; k < CPT; ++k) {
+            const int32_t x_local = (warp * CPT + k) * 32 + lane;
+            input_active[k] = x_local < tile_in_w;
+            output_active[k] = x_local < tile_out_w;
+            xt[k] = x_terms[x_base + (input_active[k] ? x_local : 0)];
+            if (k < CPT/4) square_score[k] = 0;
+        }
+        // No barrier is needed here: the previous tile ends with a block barrier,
+        // and each row synchronizes immediately after publishing its ballots.
+        if (tile_out_w == OUT_W) {
+            for (int32_t r = 3; r < 19; r += 4)
+                fused_sparse_v1_unroll4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,true,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_sparse_v1_unroll4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,true,NO_UPPER>(
+                rows, seeded_z_terms, z_base, 19, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 23; r < tile_in_h; r += 4)
+                fused_sparse_v1_unroll4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,true,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        } else {
+            for (int32_t r = 3; r < 19; r += 4)
+                fused_sparse_v1_unroll4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,false,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_sparse_v1_unroll4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,false,NO_UPPER>(
+                rows, seeded_z_terms, z_base, 19, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 23; r < tile_in_h; r += 4)
+                fused_sparse_v1_unroll4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,false,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+    if constexpr (DENSE_COUNT) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            thread_found_count += __shfl_down_sync(0xFFFFFFFFU, thread_found_count, offset);
+        if (lane == 0) atomicAdd(&block_found_count, thread_found_count);
+        __syncthreads();
+        if (tx == 0 && block_found_count != 0U)
+            atomicAdd(d_found_count, (unsigned long long)block_found_count);
+    }
+}
+// Cache exact 20x4 incoming counts for the 20x20 bound. Each byte is
+// at most 80. A slot expires after five batches; eight slots avoid overwrite.
+// Entries are private to a thread, and are refreshed during every tile warmup.
+template <int TPB, int CPT, bool DENSE_COUNT, int RNG_MODE,
+          bool HAS_OLD, bool EMIT, bool FULL_X, bool NO_UPPER>
+__device__ __forceinline__ void fused_sparse_v1_history_row(
+    uint32_t* rows, uint32_t* history, const uint64_t* __restrict__ seeded_z_terms,
+    int32_t z_base, int32_t r, int32_t lane, int32_t warp,
+    const uint64_t (&xt)[CPT], const bool (&input_active)[CPT],
+    const bool (&output_active)[CPT], int32_t (&square_score)[CPT/4],
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z, int32_t x_base,
+    int32_t tile_out_w, int32_t tile_out_h,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    uint32_t& thread_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int WARPS=TPB/32,WORDS=WARPS*CPT,STRIDE=((WORDS+4)/4)*4;
+    #pragma unroll 4
+    for(int j=0;j<4;++j) {
+    const uint64_t zt=seeded_z_terms[z_base+r-3+j];
+    uint32_t ballots[CPT];
+    #pragma unroll
+    for(int k=0;k<CPT;++k)
+        ballots[k]=__ballot_sync(0xffffffffU,(FULL_X||input_active[k])&&
+            is_slime_fast_math_seeded_z_variant<RNG_MODE>(xt[k],zt));
+    if(lane==0) {
+        #pragma unroll
+        for(int q=0;q<CPT;q+=4) {
+            uint4 packed={ballots[q],ballots[q+1],ballots[q+2],ballots[q+3]};
+            *reinterpret_cast<uint4*>(rows+((r-3+j)&31)*STRIDE+warp*CPT+q)=packed;
+        }
+    }
+    }
+    __syncthreads();
+    const int tid=warp*32+lane;
+    const int slot=(r>>2)&7;
+    const uint32_t expired=HAS_OLD?history[(((r>>2)-5)&7)*TPB+tid]:0U;
+    uint32_t packed_new=0U;
+    #pragma unroll
+    for(int k=0;k<CPT/4;++k) {
+        const int32_t gx=(warp*CPT+4*k)*32+lane*4;
+        if(gx>=tile_out_w)continue;
+        const int32_t word=warp*CPT+4*k+(lane>>3),shift=(lane&7)*4;
+        int32_t incoming=0;
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            incoming+=group4_row20<STRIDE>(rows,r-j,word,shift);
+        packed_new|=(uint32_t)incoming<<(8*k);
+        const int32_t score=square_score[k]+incoming-(int32_t)((expired>>(8*k))&255U);
+        square_score[k]=score;
+        if(EMIT&&score>=min_size) {
+            // Four 20x17 strips are strict bounds for each row of four circles.
+            const int32_t top0=group4_row20<STRIDE>(rows,r-19,word,shift);
+            const int32_t top1=group4_row20<STRIDE>(rows,r-18,word,shift);
+            const int32_t top2=group4_row20<STRIDE>(rows,r-17,word,shift);
+            const int32_t bot0=group4_row20<STRIDE>(rows,r-2,word,shift);
+            const int32_t bot1=group4_row20<STRIDE>(rows,r-1,word,shift);
+            const int32_t bot2=group4_row20<STRIDE>(rows,r,word,shift);
+            int32_t strip=score-bot0-bot1-bot2;
+            #pragma unroll 1
+            for(int dz=0;dz<4;++dz) {
+                if(r-19+dz<tile_out_h&&strip>=min_size) {
+                    #pragma unroll 1
+                    for(int dx=0;dx<4;++dx) {
+                        if(gx+dx>=tile_out_w)continue;
+                        const int32_t cx=base_x+x_base+gx+dx;
+                        const int32_t cz=slab_base_z+z_base+r-19+dz;
+                        const int64_t ddx=(int64_t)cx-search_center_x,ddz=(int64_t)cz-search_center_z;
+                        if(rd_min_sq&&ddx*ddx+ddz*ddz<rd_min_sq)continue;
+                        const int32_t exact=group4_circle<STRIDE>(rows,r,word,shift+dx,dz);
+                        if(exact>=min_size&&(NO_UPPER||exact<=max_size)) {
+                            if constexpr(DENSE_COUNT)++thread_found_count;
+                            if(!DENSE_COUNT||exact>=emit_min_size) {
+                                const auto out=atomicAdd(d_emitted_count,1ULL);
+                                if(out<(unsigned long long)max_gpu_buffer) {
+                                    d_results[out].size=exact;
+                                    d_results[out].center_x=cx*16+8;
+                                    d_results[out].center_z=cz*16+8;
+                                }
+                            }
+                        }
+                    }
+                }
+                if(dz==0)strip+=bot0-top0;
+                else if(dz==1)strip+=bot1-top1;
+                else if(dz==2)strip+=bot2-top2;
+            }
+        }
+    }
+    history[slot*TPB+tid]=packed_new;
+}
+template <int TPB, int CPT, int BAND_H, bool DENSE_COUNT, int RNG_MODE, bool NO_UPPER>
+__global__ __launch_bounds__(TPB, 1024 / TPB) void search_slime_history_kernel(
+    const uint64_t* __restrict__ x_terms,
+    const uint64_t* __restrict__ seeded_z_terms,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z,
+    int32_t out_width, int32_t out_height,
+    int32_t tiles_x, int32_t tiles_z,
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    unsigned long long* d_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int TILE_W = TPB * CPT;
+    constexpr int OUT_W = TILE_W - 16;
+    constexpr int WARPS = TPB / 32;
+    constexpr int WORDS = WARPS * CPT;
+    constexpr int STRIDE = ((WORDS + 4) / 4) * 4;
+    __shared__ __align__(16) uint32_t rows[32 * STRIDE];
+    __shared__ uint32_t block_found_count;
+    __shared__ uint32_t history[8*TPB];
+
+    const int32_t tx = (int32_t)threadIdx.x;
+    const int32_t lane = tx & 31;
+    const int32_t warp = tx >> 5;
+    uint32_t thread_found_count = 0U;
+    if (tx == 0) block_found_count = 0U;
+    if (tx < 32) rows[tx * STRIDE + WORDS] = 0U;
+    __syncthreads();
+
+    const int64_t total_tiles = (int64_t)tiles_x * (int64_t)tiles_z;
+    for (int64_t tile = (int64_t)blockIdx.x; tile < total_tiles;
+         tile += (int64_t)gridDim.x) {
+        const int32_t tile_x = (int32_t)(tile % tiles_x);
+        const int32_t tile_z = (int32_t)(tile / tiles_x);
+        const int32_t x_base = tile_x * OUT_W;
+        const int32_t z_base = tile_z * BAND_H;
+        const int32_t tile_out_w = min(OUT_W, out_width - x_base);
+        const int32_t tile_out_h = min(BAND_H, out_height - z_base);
+        const int32_t tile_in_w = tile_out_w + 16 + ((4 - (tile_out_w & 3)) & 3);
+        const int32_t tile_in_h = tile_out_h + 16 + ((4 - (tile_out_h & 3)) & 3);
+
+        uint64_t xt[CPT];
+        bool input_active[CPT];
+        bool output_active[CPT];
+        int32_t square_score[CPT/4];
+        #pragma unroll
+        for (int k = 0; k < CPT; ++k) {
+            const int32_t x_local = (warp * CPT + k) * 32 + lane;
+            input_active[k] = x_local < tile_in_w;
+            output_active[k] = x_local < tile_out_w;
+            xt[k] = x_terms[x_base + (input_active[k] ? x_local : 0)];
+            if (k < CPT/4) square_score[k] = 0;
+        }
+        // No barrier is needed here: the previous tile ends with a block barrier,
+        // and each row synchronizes immediately after publishing its ballots.
+        if (tile_out_w == OUT_W) {
+            for (int32_t r = 3; r < 19; r += 4)
+                fused_sparse_v1_history_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,true,NO_UPPER>(
+                    rows, history, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_sparse_v1_history_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,true,NO_UPPER>(
+                rows, history, seeded_z_terms, z_base, 19, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 23; r < tile_in_h; r += 4)
+                fused_sparse_v1_history_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,true,NO_UPPER>(
+                    rows, history, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        } else {
+            for (int32_t r = 3; r < 19; r += 4)
+                fused_sparse_v1_history_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,false,NO_UPPER>(
+                    rows, history, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_sparse_v1_history_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,false,NO_UPPER>(
+                rows, history, seeded_z_terms, z_base, 19, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 23; r < tile_in_h; r += 4)
+                fused_sparse_v1_history_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,false,NO_UPPER>(
+                    rows, history, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+    if constexpr (DENSE_COUNT) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            thread_found_count += __shfl_down_sync(0xFFFFFFFFU, thread_found_count, offset);
+        if (lane == 0) atomicAdd(&block_found_count, thread_found_count);
+        __syncthreads();
+        if (tx == 0 && block_found_count != 0U)
+            atomicAdd(d_found_count, (unsigned long long)block_found_count);
+    }
+}
+// Group four exact first outputs under one rare-rejection guard. If any
+// first output is rejected, recompute with the original exact Java helper.
+// Enable only for the measured CC8.6 / 256x8 / native search configuration.
+template <int TPB, int CPT, bool DENSE_COUNT, int RNG_MODE,
+          bool HAS_OLD, bool EMIT, bool FULL_X, bool NO_UPPER>
+__device__ __forceinline__ void fused_sparse_v1_guard4_row(
+    uint32_t* rows, uint32_t* history, const uint64_t* __restrict__ seeded_z_terms,
+    int32_t z_base, int32_t r, int32_t lane, int32_t warp,
+    const uint64_t (&xt)[CPT], const bool (&input_active)[CPT],
+    const bool (&output_active)[CPT], int32_t (&square_score)[CPT/4],
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z, int32_t x_base,
+    int32_t tile_out_w, int32_t tile_out_h,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    uint32_t& thread_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int WARPS=TPB/32,WORDS=WARPS*CPT,STRIDE=((WORDS+4)/4)*4;
+    #pragma unroll 4
+    for(int j=0;j<4;++j) {
+    const uint64_t zt=seeded_z_terms[z_base+r-3+j];
+    uint32_t ballots[CPT];
+    #pragma unroll
+    for(int q=0;q<CPT;q+=4) {
+        bool value[4];
+        uint32_t largest=0;
+        #pragma unroll
+        for(int i=0;i<4;++i) {
+            const uint64_t initial=(xt[q+i]+zt)^(0x3ad8025fULL^0x5deece66dULL);
+            const uint64_t state=initial*0x5deece66dULL+11ULL;
+            const uint32_t bits=(uint32_t)(state>>17)&0x7fffffffU;
+            uint32_t div=bits*0xcccccccdU;
+            div=(div>>1)|(div<<31);
+            value[i]=div<=0x19999999U;
+            largest=max(largest,bits);
+        }
+        if(__builtin_expect(largest>=2147483640U,0)) {
+            #pragma unroll
+            for(int i=0;i<4;++i)
+                value[i]=is_slime_fast_math_seeded_z(xt[q+i],zt);
+        }
+        #pragma unroll
+        for(int i=0;i<4;++i)
+            ballots[q+i]=__ballot_sync(0xffffffffU,(FULL_X||input_active[q+i])&&value[i]);
+    }
+    if(lane==0) {
+        #pragma unroll
+        for(int q=0;q<CPT;q+=4) {
+            uint4 packed={ballots[q],ballots[q+1],ballots[q+2],ballots[q+3]};
+            *reinterpret_cast<uint4*>(rows+((r-3+j)&31)*STRIDE+warp*CPT+q)=packed;
+        }
+    }
+    }
+    __syncthreads();
+    const int tid=warp*32+lane;
+    const int slot=(r>>2)&7;
+    const uint32_t expired=HAS_OLD?history[(((r>>2)-5)&7)*TPB+tid]:0U;
+    uint32_t packed_new=0U;
+    #pragma unroll
+    for(int k=0;k<CPT/4;++k) {
+        const int32_t gx=(warp*CPT+4*k)*32+lane*4;
+        if(gx>=tile_out_w)continue;
+        const int32_t word=warp*CPT+4*k+(lane>>3),shift=(lane&7)*4;
+        int32_t incoming=0;
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            incoming+=group4_row20<STRIDE>(rows,r-j,word,shift);
+        packed_new|=(uint32_t)incoming<<(8*k);
+        const int32_t score=square_score[k]+incoming-(int32_t)((expired>>(8*k))&255U);
+        square_score[k]=score;
+        if(EMIT&&score>=min_size) {
+            // Four 20x17 strips are strict bounds for each row of four circles.
+            const int32_t top0=group4_row20<STRIDE>(rows,r-19,word,shift);
+            const int32_t top1=group4_row20<STRIDE>(rows,r-18,word,shift);
+            const int32_t top2=group4_row20<STRIDE>(rows,r-17,word,shift);
+            const int32_t bot0=group4_row20<STRIDE>(rows,r-2,word,shift);
+            const int32_t bot1=group4_row20<STRIDE>(rows,r-1,word,shift);
+            const int32_t bot2=group4_row20<STRIDE>(rows,r,word,shift);
+            int32_t strip=score-bot0-bot1-bot2;
+            #pragma unroll 1
+            for(int dz=0;dz<4;++dz) {
+                if(r-19+dz<tile_out_h&&strip>=min_size) {
+                    #pragma unroll 1
+                    for(int dx=0;dx<4;++dx) {
+                        if(gx+dx>=tile_out_w)continue;
+                        const int32_t cx=base_x+x_base+gx+dx;
+                        const int32_t cz=slab_base_z+z_base+r-19+dz;
+                        const int64_t ddx=(int64_t)cx-search_center_x,ddz=(int64_t)cz-search_center_z;
+                        if(rd_min_sq&&ddx*ddx+ddz*ddz<rd_min_sq)continue;
+                        const int32_t exact=group4_circle<STRIDE>(rows,r,word,shift+dx,dz);
+                        if(exact>=min_size&&(NO_UPPER||exact<=max_size)) {
+                            if constexpr(DENSE_COUNT)++thread_found_count;
+                            if(!DENSE_COUNT||exact>=emit_min_size) {
+                                const auto out=atomicAdd(d_emitted_count,1ULL);
+                                if(out<(unsigned long long)max_gpu_buffer) {
+                                    d_results[out].size=exact;
+                                    d_results[out].center_x=cx*16+8;
+                                    d_results[out].center_z=cz*16+8;
+                                }
+                            }
+                        }
+                    }
+                }
+                if(dz==0)strip+=bot0-top0;
+                else if(dz==1)strip+=bot1-top1;
+                else if(dz==2)strip+=bot2-top2;
+            }
+        }
+    }
+    history[slot*TPB+tid]=packed_new;
+}
+template <int TPB, int CPT, int BAND_H, bool DENSE_COUNT, int RNG_MODE, bool NO_UPPER>
+__global__ __launch_bounds__(TPB, 1024 / TPB) void search_slime_guard4_kernel(
+    const uint64_t* __restrict__ x_terms,
+    const uint64_t* __restrict__ seeded_z_terms,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z,
+    int32_t out_width, int32_t out_height,
+    int32_t tiles_x, int32_t tiles_z,
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    unsigned long long* d_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int TILE_W = TPB * CPT;
+    constexpr int OUT_W = TILE_W - 16;
+    constexpr int WARPS = TPB / 32;
+    constexpr int WORDS = WARPS * CPT;
+    constexpr int STRIDE = ((WORDS + 4) / 4) * 4;
+    __shared__ __align__(16) uint32_t rows[32 * STRIDE];
+    __shared__ uint32_t block_found_count;
+    __shared__ uint32_t history[8*TPB];
+
+    const int32_t tx = (int32_t)threadIdx.x;
+    const int32_t lane = tx & 31;
+    const int32_t warp = tx >> 5;
+    uint32_t thread_found_count = 0U;
+    if (tx == 0) block_found_count = 0U;
+    if (tx < 32) rows[tx * STRIDE + WORDS] = 0U;
+    __syncthreads();
+
+    const int64_t total_tiles = (int64_t)tiles_x * (int64_t)tiles_z;
+    for (int64_t tile = (int64_t)blockIdx.x; tile < total_tiles;
+         tile += (int64_t)gridDim.x) {
+        const int32_t tile_x = (int32_t)(tile % tiles_x);
+        const int32_t tile_z = (int32_t)(tile / tiles_x);
+        const int32_t x_base = tile_x * OUT_W;
+        const int32_t z_base = tile_z * BAND_H;
+        const int32_t tile_out_w = min(OUT_W, out_width - x_base);
+        const int32_t tile_out_h = min(BAND_H, out_height - z_base);
+        const int32_t tile_in_w = tile_out_w + 16 + ((4 - (tile_out_w & 3)) & 3);
+        const int32_t tile_in_h = tile_out_h + 16 + ((4 - (tile_out_h & 3)) & 3);
+
+        uint64_t xt[CPT];
+        bool input_active[CPT];
+        bool output_active[CPT];
+        int32_t square_score[CPT/4];
+        #pragma unroll
+        for (int k = 0; k < CPT; ++k) {
+            const int32_t x_local = (warp * CPT + k) * 32 + lane;
+            input_active[k] = x_local < tile_in_w;
+            output_active[k] = x_local < tile_out_w;
+            xt[k] = x_terms[x_base + (input_active[k] ? x_local : 0)];
+            if (k < CPT/4) square_score[k] = 0;
+        }
+        // No barrier is needed here: the previous tile ends with a block barrier,
+        // and each row synchronizes immediately after publishing its ballots.
+        if (tile_out_w == OUT_W) {
+            for (int32_t r = 3; r < 19; r += 4)
+                fused_sparse_v1_guard4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,true,NO_UPPER>(
+                    rows, history, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_sparse_v1_guard4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,true,NO_UPPER>(
+                rows, history, seeded_z_terms, z_base, 19, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 23; r < tile_in_h; r += 4)
+                fused_sparse_v1_guard4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,true,NO_UPPER>(
+                    rows, history, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        } else {
+            for (int32_t r = 3; r < 19; r += 4)
+                fused_sparse_v1_guard4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,false,NO_UPPER>(
+                    rows, history, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_sparse_v1_guard4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,false,NO_UPPER>(
+                rows, history, seeded_z_terms, z_base, 19, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 23; r < tile_in_h; r += 4)
+                fused_sparse_v1_guard4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,false,NO_UPPER>(
+                    rows, history, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+    if constexpr (DENSE_COUNT) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            thread_found_count += __shfl_down_sync(0xFFFFFFFFU, thread_found_count, offset);
+        if (lane == 0) atomicAdd(&block_found_count, thread_found_count);
+        __syncthreads();
+        if (tx == 0 && block_found_count != 0U)
+            atomicAdd(d_found_count, (unsigned long long)block_found_count);
+    }
+}
+
+
+// Scalar 17x17 bounds with exact four-way Java rejection checks.
+template <int TPB, int CPT, bool DENSE_COUNT, int RNG_MODE,
+          bool HAS_OLD, bool EMIT, bool FULL_X, bool NO_UPPER>
+__device__ __forceinline__ void fused_scalar_guard4_row(
+    uint32_t* rows,
+    const uint64_t* __restrict__ seeded_z_terms,
+    int32_t z_base, int32_t r, int32_t lane, int32_t warp,
+    const uint64_t (&xt)[CPT], const bool (&input_active)[CPT],
+    const bool (&output_active)[CPT], int32_t (&square_score)[CPT],
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z, int32_t x_base,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    uint32_t& thread_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int WARPS = TPB / 32;
+    constexpr int WORDS = WARPS * CPT;
+    constexpr int STRIDE = ((WORDS + 4) / 4) * 4;
+    const int32_t slot = r & 31;
+    const uint64_t zt = seeded_z_terms[z_base + r];
+    uint32_t ballots[CPT];
+    #pragma unroll
+    for(int q=0;q<CPT;q+=4) {
+        bool value[4];
+        uint32_t largest=0;
+        #pragma unroll
+        for(int i=0;i<4;++i) {
+            const uint64_t initial=(xt[q+i]+zt)^(0x3ad8025fULL^0x5deece66dULL);
+            const uint64_t state=initial*0x5deece66dULL+11ULL;
+            const uint32_t bits=(uint32_t)(state>>17)&0x7fffffffU;
+            uint32_t div=bits*0xcccccccdU;
+            div=(div>>1)|(div<<31);
+            value[i]=div<=0x19999999U;
+            largest=max(largest,bits);
+        }
+        if(__builtin_expect(largest>=2147483640U,0)) {
+            #pragma unroll
+            for(int i=0;i<4;++i)
+                value[i]=is_slime_fast_math_seeded_z(xt[q+i],zt);
+        }
+        #pragma unroll
+        for(int i=0;i<4;++i)
+            ballots[q+i]=__ballot_sync(0xffffffffU,(FULL_X||input_active[q+i])&&value[i]);
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int q = 0; q < CPT; q += 4) {
+            uint4 packed;
+            packed.x = ballots[q + 0];
+            packed.y = ballots[q + 1];
+            packed.z = ballots[q + 2];
+            packed.w = ballots[q + 3];
+            *reinterpret_cast<uint4*>(rows + slot * STRIDE + warp * CPT + q) = packed;
+        }
+    }
+    __syncthreads();
+
+    const uint32_t* new_row = rows + slot * STRIDE;
+    const uint32_t* old_row = rows + ((r + 15) & 31) * STRIDE;
+    #pragma unroll
+    for (int k = 0; k < CPT; ++k) {
+        if (!output_active[k]) continue;
+        const int32_t word = warp * CPT + k;
+        const uint32_t next_word = (k + 1 < CPT) ? ballots[k + 1] : new_row[word + 1];
+        const uint32_t newest = __funnelshift_r(
+            ballots[k], next_word, lane) & 0x1FFFFU;
+        int32_t square = square_score[k] + __popc(newest);
+        if (HAS_OLD) {
+            const uint32_t expired = __funnelshift_r(
+                old_row[word], old_row[word + 1], lane) & 0x1FFFFU;
+            square -= __popc(expired);
+        }
+        square_score[k] = square;
+
+        if (EMIT && square >= min_size && (NO_UPPER || square <= max_size + 68)) {
+            const int32_t cx = base_x + x_base + (warp * CPT + k) * 32 + lane;
+            const int32_t cz = slab_base_z + z_base + (r - 16);
+            const int64_t dx64 = (int64_t)cx - (int64_t)search_center_x;
+            const int64_t dz64 = (int64_t)cz - (int64_t)search_center_z;
+            if (rd_min_sq != 0 && dx64 * dx64 + dz64 * dz64 < rd_min_sq)
+                continue;
+            const int32_t exact = circle_from_shared_ring<STRIDE, NO_UPPER>(
+                rows, r, word, lane, square, min_size, max_size);
+            if (exact >= min_size && (NO_UPPER || exact <= max_size)) {
+                if constexpr (!DENSE_COUNT) {
+                    const unsigned long long out = atomicAdd(d_emitted_count, 1ULL);
+                    if (out < (unsigned long long)max_gpu_buffer) {
+                        d_results[out].size = exact;
+                        d_results[out].center_x = cx * 16 + 8;
+                        d_results[out].center_z = cz * 16 + 8;
+                    }
+                } else {
+                    ++thread_found_count;
+                    if (exact >= emit_min_size) {
+                        const unsigned long long out = atomicAdd(d_emitted_count, 1ULL);
+                        if (out < (unsigned long long)max_gpu_buffer) {
+                            d_results[out].size = exact;
+                            d_results[out].center_x = cx * 16 + 8;
+                            d_results[out].center_z = cz * 16 + 8;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <int TPB, int CPT, int BAND_H, bool DENSE_COUNT, int RNG_MODE, bool NO_UPPER>
+__global__ __launch_bounds__(TPB) void search_slime_scalar_guard4_kernel(
+    const uint64_t* __restrict__ x_terms,
+    const uint64_t* __restrict__ seeded_z_terms,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z,
+    int32_t out_width, int32_t out_height,
+    int32_t tiles_x, int32_t tiles_z,
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    unsigned long long* d_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int TILE_W = TPB * CPT;
+    constexpr int OUT_W = TILE_W - 16;
+    constexpr int WARPS = TPB / 32;
+    constexpr int WORDS = WARPS * CPT;
+    constexpr int STRIDE = ((WORDS + 4) / 4) * 4;
+    __shared__ __align__(16) uint32_t rows[32 * STRIDE];
+    __shared__ uint32_t block_found_count;
+
+    const int32_t tx = (int32_t)threadIdx.x;
+    const int32_t lane = tx & 31;
+    const int32_t warp = tx >> 5;
+    uint32_t thread_found_count = 0U;
+    if (tx == 0) block_found_count = 0U;
+    if (tx < 32) rows[tx * STRIDE + WORDS] = 0U;
+    __syncthreads();
+
+    const int64_t total_tiles = (int64_t)tiles_x * (int64_t)tiles_z;
+    for (int64_t tile = (int64_t)blockIdx.x; tile < total_tiles;
+         tile += (int64_t)gridDim.x) {
+        const int32_t tile_x = (int32_t)(tile % tiles_x);
+        const int32_t tile_z = (int32_t)(tile / tiles_x);
+        const int32_t x_base = tile_x * OUT_W;
+        const int32_t z_base = tile_z * BAND_H;
+        const int32_t tile_out_w = min(OUT_W, out_width - x_base);
+        const int32_t tile_out_h = min(BAND_H, out_height - z_base);
+        const int32_t tile_in_w = tile_out_w + 16;
+        const int32_t tile_in_h = tile_out_h + 16;
+
+        uint64_t xt[CPT];
+        bool input_active[CPT];
+        bool output_active[CPT];
+        int32_t square_score[CPT];
+        #pragma unroll
+        for (int k = 0; k < CPT; ++k) {
+            const int32_t x_local = (warp * CPT + k) * 32 + lane;
+            input_active[k] = x_local < tile_in_w;
+            output_active[k] = x_local < tile_out_w;
+            xt[k] = x_terms[x_base + (input_active[k] ? x_local : 0)];
+            square_score[k] = 0;
+        }
+        // No barrier is needed here: the previous tile ends with a block barrier,
+        // and each row synchronizes immediately after publishing its ballots.
+        if (tile_out_w == OUT_W) {
+            for (int32_t r = 0; r < 16; ++r)
+                fused_scalar_guard4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,true,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_scalar_guard4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,true,NO_UPPER>(
+                rows, seeded_z_terms, z_base, 16, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 17; r < tile_in_h; ++r)
+                fused_scalar_guard4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,true,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        } else {
+            for (int32_t r = 0; r < 16; ++r)
+                fused_scalar_guard4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,false,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_scalar_guard4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,false,NO_UPPER>(
+                rows, seeded_z_terms, z_base, 16, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 17; r < tile_in_h; ++r)
+                fused_scalar_guard4_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,false,NO_UPPER>(
+                    rows, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+    if constexpr (DENSE_COUNT) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            thread_found_count += __shfl_down_sync(0xFFFFFFFFU, thread_found_count, offset);
+        if (lane == 0) atomicAdd(&block_found_count, thread_found_count);
+        __syncthreads();
+        if (tx == 0 && block_found_count != 0U)
+            atomicAdd(d_found_count, (unsigned long long)block_found_count);
+    }
+}
+
+
+
+// Exact 272-cell horizontal union before per-circle scoring.
+template <int TPB, int CPT, bool DENSE_COUNT, int RNG_MODE,
+          bool HAS_OLD, bool EMIT, bool FULL_X, bool NO_UPPER>
+__device__ __forceinline__ void fused_sparse_v1_strip272_row(
+    uint32_t* rows, uint32_t* history, const uint64_t* __restrict__ seeded_z_terms,
+    int32_t z_base, int32_t r, int32_t lane, int32_t warp,
+    const uint64_t (&xt)[CPT], const bool (&input_active)[CPT],
+    const bool (&output_active)[CPT], int32_t (&square_score)[CPT/4],
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z, int32_t x_base,
+    int32_t tile_out_w, int32_t tile_out_h,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    uint32_t& thread_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int WARPS=TPB/32,WORDS=WARPS*CPT,STRIDE=((WORDS+4)/4)*4;
+    #pragma unroll 4
+    for(int j=0;j<4;++j) {
+    const uint64_t zt=seeded_z_terms[z_base+r-3+j];
+    uint32_t ballots[CPT];
+    #pragma unroll
+    for(int q=0;q<CPT;q+=4) {
+        bool value[4];
+        uint32_t largest=0;
+        #pragma unroll
+        for(int i=0;i<4;++i) {
+            const uint64_t initial=(xt[q+i]+zt)^(0x3ad8025fULL^0x5deece66dULL);
+            const uint64_t state=initial*0x5deece66dULL+11ULL;
+            const uint32_t bits=(uint32_t)(state>>17)&0x7fffffffU;
+            uint32_t div=bits*0xcccccccdU;
+            div=(div>>1)|(div<<31);
+            value[i]=div<=0x19999999U;
+            largest=max(largest,bits);
+        }
+        if(__builtin_expect(largest>=2147483640U,0)) {
+            #pragma unroll
+            for(int i=0;i<4;++i)
+                value[i]=is_slime_fast_math_seeded_z(xt[q+i],zt);
+        }
+        #pragma unroll
+        for(int i=0;i<4;++i)
+            ballots[q+i]=__ballot_sync(0xffffffffU,(FULL_X||input_active[q+i])&&value[i]);
+    }
+    if(lane==0) {
+        #pragma unroll
+        for(int q=0;q<CPT;q+=4) {
+            uint4 packed={ballots[q],ballots[q+1],ballots[q+2],ballots[q+3]};
+            *reinterpret_cast<uint4*>(rows+((r-3+j)&31)*STRIDE+warp*CPT+q)=packed;
+        }
+    }
+    }
+    __syncthreads();
+    const int tid=warp*32+lane;
+    const int slot=(r>>2)&7;
+    const uint32_t expired=HAS_OLD?history[(((r>>2)-5)&7)*TPB+tid]:0U;
+    uint32_t packed_new=0U;
+    #pragma unroll
+    for(int k=0;k<CPT/4;++k) {
+        const int32_t gx=(warp*CPT+4*k)*32+lane*4;
+        if(gx>=tile_out_w)continue;
+        const int32_t word=warp*CPT+4*k+(lane>>3),shift=(lane&7)*4;
+        int32_t incoming=0;
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            incoming+=group4_row20<STRIDE>(rows,r-j,word,shift);
+        packed_new|=(uint32_t)incoming<<(8*k);
+        const int32_t score=square_score[k]+incoming-(int32_t)((expired>>(8*k))&255U);
+        square_score[k]=score;
+        if(EMIT&&score>=min_size) {
+            // Four 20x17 strips are strict bounds for each row of four circles.
+            const int32_t top0=group4_row20<STRIDE>(rows,r-19,word,shift);
+            const int32_t top1=group4_row20<STRIDE>(rows,r-18,word,shift);
+            const int32_t top2=group4_row20<STRIDE>(rows,r-17,word,shift);
+            const int32_t bot0=group4_row20<STRIDE>(rows,r-2,word,shift);
+            const int32_t bot1=group4_row20<STRIDE>(rows,r-1,word,shift);
+            const int32_t bot2=group4_row20<STRIDE>(rows,r,word,shift);
+            int32_t strip=score-bot0-bot1-bot2;
+            #pragma unroll 1
+            for(int dz=0;dz<4;++dz) {
+                if(r-19+dz<tile_out_h&&strip>=min_size) {
+                    constexpr int trim[6]={6,4,3,2,1,1};
+                    int upper=strip;
+                    #pragma unroll
+                    for(int i=0;i<6;++i){
+                        const uint32_t edge=((1U<<trim[i])-1U)|((0xfffffU<<(20-trim[i]))&0xfffffU);
+                        const uint32_t* a=rows+(((r-19+dz+i)&31)*STRIDE);
+                        const uint32_t* b=rows+(((r-3+dz-i)&31)*STRIDE);
+                        upper-=__popc(__funnelshift_r(a[word],a[word+1],shift)&edge);
+                        upper-=__popc(__funnelshift_r(b[word],b[word+1],shift)&edge);
+                    }
+                    if(upper>=min_size) {
+                    #pragma unroll 1
+                    for(int dx=0;dx<4;++dx) {
+                        if(gx+dx>=tile_out_w)continue;
+                        const int32_t cx=base_x+x_base+gx+dx;
+                        const int32_t cz=slab_base_z+z_base+r-19+dz;
+                        const int64_t ddx=(int64_t)cx-search_center_x,ddz=(int64_t)cz-search_center_z;
+                        if(rd_min_sq&&ddx*ddx+ddz*ddz<rd_min_sq)continue;
+                        const int32_t exact=group4_circle<STRIDE>(rows,r,word,shift+dx,dz);
+                        if(exact>=min_size&&(NO_UPPER||exact<=max_size)) {
+                            if constexpr(DENSE_COUNT)++thread_found_count;
+                            if(!DENSE_COUNT||exact>=emit_min_size) {
+                                const auto out=atomicAdd(d_emitted_count,1ULL);
+                                if(out<(unsigned long long)max_gpu_buffer) {
+                                    d_results[out].size=exact;
+                                    d_results[out].center_x=cx*16+8;
+                                    d_results[out].center_z=cz*16+8;
+                                }
+                            }
+                        }
+                    }
+                }
+                    }
+                if(dz==0)strip+=bot0-top0;
+                else if(dz==1)strip+=bot1-top1;
+                else if(dz==2)strip+=bot2-top2;
+            }
+        }
+    }
+    history[slot*TPB+tid]=packed_new;
+}
+template <int TPB, int CPT, int BAND_H, bool DENSE_COUNT, int RNG_MODE, bool NO_UPPER>
+__global__ __launch_bounds__(TPB, 1024 / TPB) void search_slime_strip272_kernel(
+    const uint64_t* __restrict__ x_terms,
+    const uint64_t* __restrict__ seeded_z_terms,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z,
+    int32_t out_width, int32_t out_height,
+    int32_t tiles_x, int32_t tiles_z,
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    unsigned long long* d_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int TILE_W = TPB * CPT;
+    constexpr int OUT_W = TILE_W - 16;
+    constexpr int WARPS = TPB / 32;
+    constexpr int WORDS = WARPS * CPT;
+    constexpr int STRIDE = ((WORDS + 4) / 4) * 4;
+    __shared__ __align__(16) uint32_t rows[32 * STRIDE];
+    __shared__ uint32_t block_found_count;
+    __shared__ uint32_t history[8*TPB];
+
+    const int32_t tx = (int32_t)threadIdx.x;
+    const int32_t lane = tx & 31;
+    const int32_t warp = tx >> 5;
+    uint32_t thread_found_count = 0U;
+    if (tx == 0) block_found_count = 0U;
+    if (tx < 32) rows[tx * STRIDE + WORDS] = 0U;
+    __syncthreads();
+
+    const int64_t total_tiles = (int64_t)tiles_x * (int64_t)tiles_z;
+    for (int64_t tile = (int64_t)blockIdx.x; tile < total_tiles;
+         tile += (int64_t)gridDim.x) {
+        const int32_t tile_x = (int32_t)(tile % tiles_x);
+        const int32_t tile_z = (int32_t)(tile / tiles_x);
+        const int32_t x_base = tile_x * OUT_W;
+        const int32_t z_base = tile_z * BAND_H;
+        const int32_t tile_out_w = min(OUT_W, out_width - x_base);
+        const int32_t tile_out_h = min(BAND_H, out_height - z_base);
+        const int32_t tile_in_w = tile_out_w + 16 + ((4 - (tile_out_w & 3)) & 3);
+        const int32_t tile_in_h = tile_out_h + 16 + ((4 - (tile_out_h & 3)) & 3);
+
+        uint64_t xt[CPT];
+        bool input_active[CPT];
+        bool output_active[CPT];
+        int32_t square_score[CPT/4];
+        #pragma unroll
+        for (int k = 0; k < CPT; ++k) {
+            const int32_t x_local = (warp * CPT + k) * 32 + lane;
+            input_active[k] = x_local < tile_in_w;
+            output_active[k] = x_local < tile_out_w;
+            xt[k] = x_terms[x_base + (input_active[k] ? x_local : 0)];
+            if (k < CPT/4) square_score[k] = 0;
+        }
+        // No barrier is needed here: the previous tile ends with a block barrier,
+        // and each row synchronizes immediately after publishing its ballots.
+        if (tile_out_w == OUT_W) {
+            for (int32_t r = 3; r < 19; r += 4)
+                fused_sparse_v1_strip272_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,true,NO_UPPER>(
+                    rows, history, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_sparse_v1_strip272_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,true,NO_UPPER>(
+                rows, history, seeded_z_terms, z_base, 19, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 23; r < tile_in_h; r += 4)
+                fused_sparse_v1_strip272_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,true,NO_UPPER>(
+                    rows, history, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        } else {
+            for (int32_t r = 3; r < 19; r += 4)
+                fused_sparse_v1_strip272_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,false,NO_UPPER>(
+                    rows, history, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_sparse_v1_strip272_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,false,NO_UPPER>(
+                rows, history, seeded_z_terms, z_base, 19, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 23; r < tile_in_h; r += 4)
+                fused_sparse_v1_strip272_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,false,NO_UPPER>(
+                    rows, history, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+    if constexpr (DENSE_COUNT) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            thread_found_count += __shfl_down_sync(0xFFFFFFFFU, thread_found_count, offset);
+        if (lane == 0) atomicAdd(&block_found_count, thread_found_count);
+        __syncthreads();
+        if (tx == 0 && block_found_count != 0U)
+            atomicAdd(d_found_count, (unsigned long long)block_found_count);
+    }
+}
+
+
+
+
+// Measured threshold60 progressive272 bound. Stop after three symmetric
+// corner pairs when the remaining strict upper bound is already too small.
+// Preserve the original Java rejection helper and exact221-circle counts.
+template <int TPB, int CPT, bool DENSE_COUNT, int RNG_MODE,
+          bool HAS_OLD, bool EMIT, bool FULL_X, bool NO_UPPER>
+__device__ __forceinline__ void fused_sparse_v1_early3_row(
+    uint32_t* rows, uint32_t* history, const uint64_t* __restrict__ seeded_z_terms,
+    int32_t z_base, int32_t r, int32_t lane, int32_t warp,
+    const uint64_t (&xt)[CPT], const bool (&input_active)[CPT],
+    const bool (&output_active)[CPT], int32_t (&square_score)[CPT/4],
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z, int32_t x_base,
+    int32_t tile_out_w, int32_t tile_out_h,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    uint32_t& thread_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int WARPS=TPB/32,WORDS=WARPS*CPT,STRIDE=((WORDS+4)/4)*4;
+    #pragma unroll 4
+    for(int j=0;j<4;++j) {
+    const uint64_t zt=seeded_z_terms[z_base+r-3+j];
+    uint32_t ballots[CPT];
+    #pragma unroll
+    for(int q=0;q<CPT;q+=4) {
+        bool value[4];
+        uint32_t largest=0;
+        #pragma unroll
+        for(int i=0;i<4;++i) {
+            const uint64_t initial=(xt[q+i]+zt)^(0x3ad8025fULL^0x5deece66dULL);
+            const uint64_t state=initial*0x5deece66dULL+11ULL;
+            const uint32_t bits=(uint32_t)(state>>17)&0x7fffffffU;
+            uint32_t div=bits*0xcccccccdU;
+            div=(div>>1)|(div<<31);
+            value[i]=div<=0x19999999U;
+            largest=max(largest,bits);
+        }
+        if(__builtin_expect(largest>=2147483640U,0)) {
+            #pragma unroll
+            for(int i=0;i<4;++i)
+                value[i]=is_slime_fast_math_seeded_z(xt[q+i],zt);
+        }
+        #pragma unroll
+        for(int i=0;i<4;++i)
+            ballots[q+i]=__ballot_sync(0xffffffffU,(FULL_X||input_active[q+i])&&value[i]);
+    }
+    if(lane==0) {
+        #pragma unroll
+        for(int q=0;q<CPT;q+=4) {
+            uint4 packed={ballots[q],ballots[q+1],ballots[q+2],ballots[q+3]};
+            *reinterpret_cast<uint4*>(rows+((r-3+j)&31)*STRIDE+warp*CPT+q)=packed;
+        }
+    }
+    }
+    __syncthreads();
+    const int tid=warp*32+lane;
+    const int slot=(r>>2)&7;
+    const uint32_t expired=HAS_OLD?history[(((r>>2)-5)&7)*TPB+tid]:0U;
+    uint32_t packed_new=0U;
+    #pragma unroll
+    for(int k=0;k<CPT/4;++k) {
+        const int32_t gx=(warp*CPT+4*k)*32+lane*4;
+        if(gx>=tile_out_w)continue;
+        const int32_t word=warp*CPT+4*k+(lane>>3),shift=(lane&7)*4;
+        int32_t incoming=0;
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            incoming+=group4_row20<STRIDE>(rows,r-j,word,shift);
+        packed_new|=(uint32_t)incoming<<(8*k);
+        const int32_t score=square_score[k]+incoming-(int32_t)((expired>>(8*k))&255U);
+        square_score[k]=score;
+        if(EMIT&&score>=min_size) {
+            // Four 20x17 strips are strict bounds for each row of four circles.
+            const int32_t top0=group4_row20<STRIDE>(rows,r-19,word,shift);
+            const int32_t top1=group4_row20<STRIDE>(rows,r-18,word,shift);
+            const int32_t top2=group4_row20<STRIDE>(rows,r-17,word,shift);
+            const int32_t bot0=group4_row20<STRIDE>(rows,r-2,word,shift);
+            const int32_t bot1=group4_row20<STRIDE>(rows,r-1,word,shift);
+            const int32_t bot2=group4_row20<STRIDE>(rows,r,word,shift);
+            int32_t strip=score-bot0-bot1-bot2;
+            #pragma unroll 1
+            for(int dz=0;dz<4;++dz) {
+                if(r-19+dz<tile_out_h&&strip>=min_size) {
+                    constexpr int trim[6]={6,4,3,2,1,1};
+                    int upper=strip;
+                    #pragma unroll
+                    for(int i=0;i<6;++i){
+                        const uint32_t edge=((1U<<trim[i])-1U)|((0xfffffU<<(20-trim[i]))&0xfffffU);
+                        const uint32_t* a=rows+(((r-19+dz+i)&31)*STRIDE);
+                        const uint32_t* b=rows+(((r-3+dz-i)&31)*STRIDE);
+                        upper-=__popc(__funnelshift_r(a[word],a[word+1],shift)&edge);
+                        upper-=__popc(__funnelshift_r(b[word],b[word+1],shift)&edge);
+                        if((i%3)==2 && upper<min_size)break;
+                    }
+                    if(upper>=min_size) {
+                    #pragma unroll 1
+                    for(int dx=0;dx<4;++dx) {
+                        if(gx+dx>=tile_out_w)continue;
+                        const int32_t cx=base_x+x_base+gx+dx;
+                        const int32_t cz=slab_base_z+z_base+r-19+dz;
+                        const int64_t ddx=(int64_t)cx-search_center_x,ddz=(int64_t)cz-search_center_z;
+                        if(rd_min_sq&&ddx*ddx+ddz*ddz<rd_min_sq)continue;
+                        const int32_t exact=group4_circle<STRIDE>(rows,r,word,shift+dx,dz);
+                        if(exact>=min_size&&(NO_UPPER||exact<=max_size)) {
+                            if constexpr(DENSE_COUNT)++thread_found_count;
+                            if(!DENSE_COUNT||exact>=emit_min_size) {
+                                const auto out=atomicAdd(d_emitted_count,1ULL);
+                                if(out<(unsigned long long)max_gpu_buffer) {
+                                    d_results[out].size=exact;
+                                    d_results[out].center_x=cx*16+8;
+                                    d_results[out].center_z=cz*16+8;
+                                }
+                            }
+                        }
+                    }
+                }
+                    }
+                if(dz==0)strip+=bot0-top0;
+                else if(dz==1)strip+=bot1-top1;
+                else if(dz==2)strip+=bot2-top2;
+            }
+        }
+    }
+    history[slot*TPB+tid]=packed_new;
+}
+template <int TPB, int CPT, int BAND_H, bool DENSE_COUNT, int RNG_MODE, bool NO_UPPER>
+__global__ __launch_bounds__(TPB, 1024 / TPB) void search_slime_early3_kernel(
+    const uint64_t* __restrict__ x_terms,
+    const uint64_t* __restrict__ seeded_z_terms,
+    int32_t search_center_x, int32_t search_center_z,
+    int32_t base_x, int32_t slab_base_z,
+    int32_t out_width, int32_t out_height,
+    int32_t tiles_x, int32_t tiles_z,
+    int32_t min_size, int32_t max_size, int32_t emit_min_size, int64_t rd_min_sq,
+    ExtChunkResult* d_results, int32_t max_gpu_buffer,
+    unsigned long long* d_found_count, unsigned long long* d_emitted_count
+) {
+    constexpr int TILE_W = TPB * CPT;
+    constexpr int OUT_W = TILE_W - 16;
+    constexpr int WARPS = TPB / 32;
+    constexpr int WORDS = WARPS * CPT;
+    constexpr int STRIDE = ((WORDS + 4) / 4) * 4;
+    __shared__ __align__(16) uint32_t rows[32 * STRIDE];
+    __shared__ uint32_t block_found_count;
+    __shared__ uint32_t history[8*TPB];
+
+    const int32_t tx = (int32_t)threadIdx.x;
+    const int32_t lane = tx & 31;
+    const int32_t warp = tx >> 5;
+    uint32_t thread_found_count = 0U;
+    if (tx == 0) block_found_count = 0U;
+    if (tx < 32) rows[tx * STRIDE + WORDS] = 0U;
+    __syncthreads();
+
+    const int64_t total_tiles = (int64_t)tiles_x * (int64_t)tiles_z;
+    for (int64_t tile = (int64_t)blockIdx.x; tile < total_tiles;
+         tile += (int64_t)gridDim.x) {
+        const int32_t tile_x = (int32_t)(tile % tiles_x);
+        const int32_t tile_z = (int32_t)(tile / tiles_x);
+        const int32_t x_base = tile_x * OUT_W;
+        const int32_t z_base = tile_z * BAND_H;
+        const int32_t tile_out_w = min(OUT_W, out_width - x_base);
+        const int32_t tile_out_h = min(BAND_H, out_height - z_base);
+        const int32_t tile_in_w = tile_out_w + 16 + ((4 - (tile_out_w & 3)) & 3);
+        const int32_t tile_in_h = tile_out_h + 16 + ((4 - (tile_out_h & 3)) & 3);
+
+        uint64_t xt[CPT];
+        bool input_active[CPT];
+        bool output_active[CPT];
+        int32_t square_score[CPT/4];
+        #pragma unroll
+        for (int k = 0; k < CPT; ++k) {
+            const int32_t x_local = (warp * CPT + k) * 32 + lane;
+            input_active[k] = x_local < tile_in_w;
+            output_active[k] = x_local < tile_out_w;
+            xt[k] = x_terms[x_base + (input_active[k] ? x_local : 0)];
+            if (k < CPT/4) square_score[k] = 0;
+        }
+        // No barrier is needed here: the previous tile ends with a block barrier,
+        // and each row synchronizes immediately after publishing its ballots.
+        if (tile_out_w == OUT_W) {
+            for (int32_t r = 3; r < 19; r += 4)
+                fused_sparse_v1_early3_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,true,NO_UPPER>(
+                    rows, history, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_sparse_v1_early3_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,true,NO_UPPER>(
+                rows, history, seeded_z_terms, z_base, 19, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 23; r < tile_in_h; r += 4)
+                fused_sparse_v1_early3_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,true,NO_UPPER>(
+                    rows, history, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        } else {
+            for (int32_t r = 3; r < 19; r += 4)
+                fused_sparse_v1_early3_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,false,false,NO_UPPER>(
+                    rows, history, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            fused_sparse_v1_early3_row<TPB,CPT,DENSE_COUNT,RNG_MODE,false,true,false,NO_UPPER>(
+                rows, history, seeded_z_terms, z_base, 19, lane, warp,
+                xt, input_active, output_active, square_score,
+                min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+            for (int32_t r = 23; r < tile_in_h; r += 4)
+                fused_sparse_v1_early3_row<TPB,CPT,DENSE_COUNT,RNG_MODE,true,true,false,NO_UPPER>(
+                    rows, history, seeded_z_terms, z_base, r, lane, warp,
+                    xt, input_active, output_active, square_score,
+                    min_size, max_size, emit_min_size, rd_min_sq, search_center_x, search_center_z,
+                    base_x, slab_base_z, x_base, tile_out_w, tile_out_h,
+                    d_results, max_gpu_buffer, thread_found_count, d_emitted_count);
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+    if constexpr (DENSE_COUNT) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            thread_found_count += __shfl_down_sync(0xFFFFFFFFU, thread_found_count, offset);
+        if (lane == 0) atomicAdd(&block_found_count, thread_found_count);
+        __syncthreads();
+        if (tx == 0 && block_found_count != 0U)
+            atomicAdd(d_found_count, (unsigned long long)block_found_count);
+    }
+}
+
+
+
 
 __device__ bool checkSlimeDevice(int64_t seed, int64_t global_x, int64_t global_z) {
     uint64_t p_x = calc_x_part((uint32_t)(int32_t)global_x);
@@ -963,6 +2889,135 @@ __global__ void refine_afk_block_kernel(
         d_top_results[idx].afk_z = s_best_z[0];
     }
 }
+__global__ void refine_afk_xz_kernel(
+    int64_t seed, ExtChunkResult* d_top_results, int32_t count,
+    int32_t platform_y, int32_t y_count, const int32_t* y_values,
+    const int16_t* outer_radius_table, const int16_t* inner_radius_table,
+    const uint16_t* chunk_weights
+) {
+    int idx = blockIdx.x;
+    int tid = threadIdx.x;
+    if (idx >= count) return;
+
+    int64_t bx = d_top_results[idx].center_x;
+    int64_t bz = d_top_results[idx].center_z;
+
+    int32_t local_best_obs = -1;
+    int32_t local_best_order = 0x7fffffff;
+    int32_t local_best_x = (int32_t)bx;
+    int32_t local_best_z = (int32_t)bz;
+    int32_t local_best_y = platform_y;
+
+    __shared__ uint32_t union_cache[23];
+    __shared__ int64_t union_base_cx_s;
+    __shared__ int64_t union_base_cz_s;
+    __shared__ int32_t s_best_obs[REFINE_BLOCK_THREADS];
+    __shared__ int32_t s_best_order[REFINE_BLOCK_THREADS];
+    __shared__ int32_t s_best_x[REFINE_BLOCK_THREADS];
+    __shared__ int32_t s_best_z[REFINE_BLOCK_THREADS];
+    __shared__ int32_t s_best_y[REFINE_BLOCK_THREADS];
+
+    constexpr int32_t safe_y_count = 1;
+
+    // Build the complete chunk window needed by all 81 refinement positions.
+    // The old kernel rebuilt a 21x21 hash cache for every position.
+    if (tid == 0) {
+        union_base_cx_s = floor_div16(bx) - 11;
+        union_base_cz_s = floor_div16(bz) - 11;
+    }
+    __syncthreads();
+    if (tid < 23) {
+        uint32_t row_mask = 0;
+        for (int32_t j = 0; j < 23; ++j) {
+            if (checkSlimeDevice(seed, union_base_cx_s + tid, union_base_cz_s + j)) {
+                row_mask |= (1U << j);
+            }
+        }
+        union_cache[tid] = row_mask;
+    }
+    __syncthreads();
+
+    for (int32_t off = tid; off < 81; off += blockDim.x) {
+        int32_t dx = -16 + (off / 9) * 4;
+        int32_t dz = -16 + (off % 9) * 4;
+        int64_t ox = bx + dx;
+        int64_t oz = bz + dz;
+
+        int64_t base_cx = floor_div16(ox) - 10;
+        int64_t base_cz = floor_div16(oz) - 10;
+
+        for (int32_t yi = 0; yi < safe_y_count; ++yi) {
+            const int16_t* outer = outer_radius_table + (size_t)yi * DX_TABLE_COUNT;
+            const int16_t* inner = inner_radius_table + (size_t)yi * DX_TABLE_COUNT;
+            int32_t obs = count_spawnable_union_weight_device(
+                union_cache, union_base_cx_s, union_base_cz_s,
+                base_cx, base_cz, ox, oz, yi, safe_y_count, chunk_weights);
+            if (obs < 0) {
+                obs = count_spawnable_union_table_device(
+                    union_cache, union_base_cx_s, union_base_cz_s,
+                    base_cx, base_cz, ox, oz, outer, inner);
+            }
+            int32_t order = off * safe_y_count + yi;
+            if (obs > local_best_obs || (obs == local_best_obs && order < local_best_order)) {
+                local_best_obs = obs;
+                local_best_order = order;
+                local_best_x = (int32_t)ox;
+                local_best_z = (int32_t)oz;
+                local_best_y = y_values[yi];
+            }
+        }
+    }
+
+    s_best_obs[tid] = local_best_obs;
+    s_best_order[tid] = local_best_order;
+    s_best_x[tid] = local_best_x;
+    s_best_z[tid] = local_best_z;
+    s_best_y[tid] = local_best_y;
+    __syncthreads();
+
+    for (int32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            int32_t other_obs = s_best_obs[tid + stride];
+            int32_t other_order = s_best_order[tid + stride];
+            if (other_obs > s_best_obs[tid] || (other_obs == s_best_obs[tid] && other_order < s_best_order[tid])) {
+                s_best_obs[tid] = other_obs;
+                s_best_order[tid] = other_order;
+                s_best_x[tid] = s_best_x[tid + stride];
+                s_best_z[tid] = s_best_z[tid + stride];
+                s_best_y[tid] = s_best_y[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        d_top_results[idx].obs_count = pack_obs_y(s_best_obs[0], s_best_y[0]);
+        d_top_results[idx].afk_x = s_best_x[0];
+        d_top_results[idx].afk_z = s_best_z[0];
+    }
+}
+
+// Measured single-Y exact XZ scoring. Keep all multi-Y schedules intact.
+static void launch_refine_xz_or_original(
+    int64_t seed, ExtChunkResult* results, int32_t count,
+    int32_t platform_y, int32_t y_count, const int32_t* y_values,
+    const int16_t* outer, const int16_t* inner, const uint16_t* weights
+) {
+    const char* setting=std::getenv("SLIME_GPU_REFINE_XZ_PARALLEL");
+    bool enabled=y_count==1 && (!setting || std::strcmp(setting,"0")!=0);
+    if(enabled) {
+        int device=0;cudaDeviceProp prop{};
+        enabled=cudaGetDevice(&device)==cudaSuccess &&
+            cudaGetDeviceProperties(&prop,device)==cudaSuccess &&
+            prop.major==8 && prop.minor==6;
+    }
+    if(enabled)
+        refine_afk_xz_kernel<<<count,REFINE_BLOCK_THREADS>>>(seed,results,count,
+            platform_y,y_count,y_values,outer,inner,weights);
+    else
+        refine_afk_block_kernel<<<count,REFINE_BLOCK_THREADS>>>(seed,results,count,
+            platform_y,y_count,y_values,outer,inner,weights);
+}
 
 extern "C" {
     __declspec(dllexport) int32_t get_cuda_device_count() {
@@ -1095,7 +3150,7 @@ extern "C" {
         ExtChunkResult* results_buffer, int32_t max_results, int32_t precise_afk
     ) {
         if (!results_buffer || max_results <= 0 || rd_max < 0 ||
-            rd_max > (INT32_MAX - 17LL) / 2LL || rd_min < 0 || rd_min > rd_max ||
+            rd_max > (INT32_MAX - 19LL) / 2LL || rd_min < 0 || rd_min > rd_max ||
             min_size < 0 || min_size > 221 || max_size < min_size) return -1;
         if ((int64_t)search_center_x - rd_max - 8LL < INT32_MIN ||
             (int64_t)search_center_x + rd_max + 8LL > INT32_MAX ||
@@ -1109,7 +3164,7 @@ extern "C" {
         const int32_t base_x = (int32_t)((int64_t)search_center_x - rd_max);
         const int32_t base_z = (int32_t)((int64_t)search_center_z - rd_max);
         const int64_t rd_min_sq = rd_min * rd_min;
-        const size_t term_count = (size_t)width + 16U;
+        const size_t term_count = (size_t)width + 19U;
 
         std::vector<uint64_t> h_x_terms(term_count);
         std::vector<uint64_t> h_z_terms(term_count);
@@ -1190,12 +3245,209 @@ extern "C" {
         int32_t slab_height = (int32_t)std::max<int64_t>(
             MIN_SLAB_H, std::min<int64_t>(MAX_SLAB_H, desired_slab_h));
         slab_height = std::max(BAND_H, (slab_height / BAND_H) * BAND_H);
+        // The 18x18 union strictly bounds all four exact 221-cell circles.
+        // Keep the existing path for dense thresholds and short searches.
+        const char* group2_setting = std::getenv("SLIME_GPU_V1_GROUP2");
+        const bool use_group2 = min_size >= 60 && max_size >= 221 &&
+            (int64_t)width * height >= 100000000000LL &&
+            (!group2_setting || std::strcmp(group2_setting, "0") != 0);
+        // 4x4 groups use an exact20x20 union followed by exact20x17 strips.
+        // Disabling this path keeps the previously verified2x2 scan.
+        const char* group4_setting = std::getenv("SLIME_GPU_V1_GROUP4");
+        const bool use_group4 = use_group2 &&
+            (!group4_setting || std::strcmp(group4_setting, "0") != 0);
+        // Publish four consecutive ring rows before the block barrier.
+        // 20 live rows in a 32-row ring leave 12 slots: the next four writes
+        // cannot overwrite any row read by this batch's bounds or circles.
+        const char* batch4_setting = std::getenv("SLIME_GPU_V1_BATCH4");
+        const bool use_batch4 = use_group4 &&
+            (!batch4_setting || std::strcmp(batch4_setting, "0") != 0);
+        // Full four-row generation unrolling, with an occupancy constraint
+        // matching 1024 resident threads. Keep the verified loop as fallback.
+        const char* unroll4_setting = std::getenv("SLIME_GPU_V1_UNROLL4");
+        const bool use_unroll4 = use_batch4 &&
+            (!unroll4_setting || std::strcmp(unroll4_setting, "0") != 0);
+        int32_t device = 0;
+        cudaDeviceProp prop{};
+        bool have_prop = cudaGetDevice(&device) == cudaSuccess &&
+                         cudaGetDeviceProperties(&prop, device) == cudaSuccess;
+        // Enable by default only on measured CC8.6 devices. Other generations
+        // retain the previous kernel and local shape/RNG tuning.
+        const char* history_setting=std::getenv("SLIME_GPU_V1_HISTORY");
+        const bool use_history=use_unroll4 && (history_setting
+            ? std::strcmp(history_setting,"0")!=0
+            : have_prop && prop.major==8 && prop.minor==6);
+        const char* guard4_setting=std::getenv("SLIME_GPU_V1_GUARD4");
+        const bool use_guard4=use_history && (guard4_setting
+            ? std::strcmp(guard4_setting,"0")!=0
+            : have_prop && prop.major==8 && prop.minor==6);
+        // Thresholds55..59 reuse the exact Guard4 kernel only in the
+        // measured CC8.6/native/256x8 configuration. Keep tuning independent
+        // from the old fused path and the threshold60+ Guard4 workload.
+        const char* guard4_mid_setting=std::getenv("SLIME_GPU_V1_GUARD4_MID");
+        const auto path_enabled=[](const char* value) {
+            return !value || std::strcmp(value,"0")!=0;
+        };
+        // Measured smaller-area route (1M..100B, thresholds55..60, CC8.6).
+        // Keep the old short-search default for alternate RNG overrides.
+        const char* midscale_rng=std::getenv("SLIME_GPU_V1_RNG");
+        if (!midscale_rng) midscale_rng=std::getenv("SLIME_GPU_V34_RNG");
+        const bool midscale_native=g_v1_rng_override>=0 ? g_v1_rng_override==0 :
+            (!midscale_rng || std::strcmp(midscale_rng,"native")==0 ||
+             std::strcmp(midscale_rng,"baseline")==0 || std::strcmp(midscale_rng,"0")==0);
+        const char* midscale_setting=std::getenv("SLIME_GPU_V1_MIDSCALE");
+        const int64_t v1_area=(int64_t)width*height;
+        const bool use_midscale=min_size>=55 && min_size<=60 && max_size>=221 &&
+            v1_area>=1000000LL && v1_area<100000000000LL &&
+            have_prop && prop.major==8 && prop.minor==6 &&
+            path_enabled(group2_setting) && path_enabled(group4_setting) &&
+            path_enabled(batch4_setting) && path_enabled(unroll4_setting) &&
+            path_enabled(history_setting) && path_enabled(guard4_setting) &&
+            midscale_native && path_enabled(midscale_setting) &&
+            (min_size==60 ? path_enabled(std::getenv("SLIME_GPU_V1_EARLY272")) :
+             path_enabled(guard4_mid_setting) && path_enabled(std::getenv("SLIME_GPU_V1_STRIP272")));
+        const bool use_guard4_mid=min_size>=55 && min_size<60 && max_size>=221 &&
+            ((int64_t)width*height>=100000000000LL || use_midscale) &&
+            have_prop && prop.major==8 && prop.minor==6 &&
+            path_enabled(group2_setting) && path_enabled(group4_setting) &&
+            path_enabled(batch4_setting) && path_enabled(unroll4_setting) &&
+            path_enabled(history_setting) && path_enabled(guard4_setting) &&
+            path_enabled(guard4_mid_setting);
+        // Measured threshold40 configuration; preserve dense exact counting
+        // and completion passes independently from the sparse Guard4 path.
+        const char* scalar_guard4_setting=std::getenv("SLIME_GPU_V1_SCALAR_GUARD4");
+        const bool use_scalar_guard4=min_size==40 && max_size>=221 &&
+            (int64_t)width*height>=100000000000LL &&
+            have_prop && prop.major==8 && prop.minor==6 &&
+            path_enabled(guard4_setting) && path_enabled(scalar_guard4_setting);
+        const char* strip272_setting=std::getenv("SLIME_GPU_V1_STRIP272");
+        const bool use_strip272=min_size>=55 && min_size<=59 &&
+            (use_guard4_mid || use_guard4) &&
+            have_prop && prop.major==8 && prop.minor==6 &&
+            path_enabled(strip272_setting);
+        const char* early272_setting=std::getenv("SLIME_GPU_V1_EARLY272");
+        const bool use_early272=min_size==60 && max_size>=221 &&
+            ((int64_t)width*height>=100000000000LL || use_midscale) &&
+            (use_guard4 || use_midscale) &&
+            have_prop && prop.major==8 && prop.minor==6 &&
+            path_enabled(early272_setting);
         auto launch_v1 = [&](int32_t shape, int32_t rng_variant,
                               int32_t launch_z_offset,
                               int32_t launch_width, int32_t launch_height,
                               int32_t launch_tiles_x, int32_t launch_tiles_z,
                               int32_t launch_blocks, int32_t emit_min_size) -> cudaError_t {
             #define LAUNCH_V1_SHAPE_IMPL(T, C, R, N) do { \
+                if constexpr (N && R==0 && T==128 && C==8) { \
+                    if(use_scalar_guard4) { \
+                        if(emit_min_size>min_size) \
+                            search_slime_scalar_guard4_kernel<128,8,BAND_H,true,0,true><<<launch_blocks,128>>>( \
+                                d_x_terms,d_z_terms+launch_z_offset,search_center_x,search_center_z, \
+                                base_x,base_z+launch_z_offset,launch_width,launch_height, \
+                                launch_tiles_x,launch_tiles_z,min_size,max_size,emit_min_size,rd_min_sq, \
+                                d_results,gpu_buffer_cap,d_found_count,d_emitted_count); \
+                        else \
+                            search_slime_scalar_guard4_kernel<128,8,BAND_H,false,0,true><<<launch_blocks,128>>>( \
+                                d_x_terms,d_z_terms+launch_z_offset,search_center_x,search_center_z, \
+                                base_x,base_z+launch_z_offset,launch_width,launch_height, \
+                                launch_tiles_x,launch_tiles_z,min_size,max_size,emit_min_size,rd_min_sq, \
+                                d_results,gpu_buffer_cap,d_found_count,d_emitted_count); \
+                        break; \
+                    } \
+                } \
+                if constexpr(N && R==0 && T==256 && C==8) { \
+                    if(use_early272) { \
+                        search_slime_early3_kernel<256,8,BAND_H,false,0,true><<<launch_blocks,256>>>( \
+                            d_x_terms,d_z_terms+launch_z_offset,search_center_x,search_center_z, \
+                            base_x,base_z+launch_z_offset,launch_width,launch_height, \
+                            launch_tiles_x,launch_tiles_z,min_size,max_size,emit_min_size,rd_min_sq, \
+                            d_results,gpu_buffer_cap,d_found_count,d_emitted_count); \
+                        break; \
+                    } \
+                } \
+                if constexpr(N && R==0 && T==256 && C==8) { \
+                    if(use_strip272) { \
+                        search_slime_strip272_kernel<256,8,BAND_H,false,0,true><<<launch_blocks,256>>>( \
+                            d_x_terms,d_z_terms+launch_z_offset,search_center_x,search_center_z, \
+                            base_x,base_z+launch_z_offset,launch_width,launch_height, \
+                            launch_tiles_x,launch_tiles_z,min_size,max_size,emit_min_size,rd_min_sq, \
+                            d_results,gpu_buffer_cap,d_found_count,d_emitted_count); \
+                        break; \
+                    } \
+                } \
+                if constexpr (N) { \
+                    if constexpr(R==0) { \
+                        if(T==256 && C==8 && use_guard4_mid) { \
+                            search_slime_guard4_kernel<256,8,BAND_H,false,0,true><<<launch_blocks,256>>>( \
+                                d_x_terms,d_z_terms+launch_z_offset,search_center_x,search_center_z, \
+                                base_x,base_z+launch_z_offset,launch_width,launch_height, \
+                                launch_tiles_x,launch_tiles_z,min_size,max_size,emit_min_size,rd_min_sq, \
+                                d_results,gpu_buffer_cap,d_found_count,d_emitted_count); \
+                            break; \
+                        } \
+                    } \
+                    if (use_history) { \
+                        if constexpr(R==0) { \
+                            if(T==256 && C==8 && use_guard4) { \
+                                    search_slime_guard4_kernel<256,8,BAND_H,false,0,true><<<launch_blocks,256>>>( \
+                                        d_x_terms,d_z_terms+launch_z_offset,search_center_x,search_center_z, \
+                                        base_x,base_z+launch_z_offset,launch_width,launch_height, \
+                                        launch_tiles_x,launch_tiles_z,min_size,max_size,emit_min_size,rd_min_sq, \
+                                        d_results,gpu_buffer_cap,d_found_count,d_emitted_count); \
+                                    break; \
+                            } \
+                            search_slime_history_kernel<T, C, BAND_H, false, 0, true><<<launch_blocks, T>>>( \
+                                d_x_terms, d_z_terms + launch_z_offset, \
+                                search_center_x, search_center_z, \
+                                base_x, base_z + launch_z_offset, launch_width, launch_height, \
+                                launch_tiles_x, launch_tiles_z, min_size, max_size, emit_min_size, rd_min_sq, \
+                                d_results, gpu_buffer_cap, d_found_count, d_emitted_count); \
+                        } else { \
+                            search_slime_unroll4_cap64_kernel<T, C, BAND_H, false, R, true><<<launch_blocks, T>>>( \
+                                d_x_terms, d_z_terms + launch_z_offset, \
+                                search_center_x, search_center_z, \
+                                base_x, base_z + launch_z_offset, launch_width, launch_height, \
+                                launch_tiles_x, launch_tiles_z, min_size, max_size, emit_min_size, rd_min_sq, \
+                                d_results, gpu_buffer_cap, d_found_count, d_emitted_count); \
+                        } \
+                        break; \
+                    } \
+                    if (use_unroll4) { \
+                        search_slime_unroll4_cap64_kernel<T, C, BAND_H, false, R, true><<<launch_blocks, T>>>( \
+                            d_x_terms, d_z_terms + launch_z_offset, \
+                            search_center_x, search_center_z, \
+                            base_x, base_z + launch_z_offset, launch_width, launch_height, \
+                            launch_tiles_x, launch_tiles_z, min_size, max_size, emit_min_size, rd_min_sq, \
+                            d_results, gpu_buffer_cap, d_found_count, d_emitted_count); \
+                        break; \
+                    } \
+                    if (use_batch4) { \
+                        search_slime_batch4_kernel<T, C, BAND_H, false, R, true><<<launch_blocks, T>>>( \
+                            d_x_terms, d_z_terms + launch_z_offset, \
+                            search_center_x, search_center_z, \
+                            base_x, base_z + launch_z_offset, launch_width, launch_height, \
+                            launch_tiles_x, launch_tiles_z, min_size, max_size, emit_min_size, rd_min_sq, \
+                            d_results, gpu_buffer_cap, d_found_count, d_emitted_count); \
+                        break; \
+                    } \
+                    if (use_group4) { \
+                        search_slime_group4_kernel<T, C, BAND_H, false, R, true><<<launch_blocks, T>>>( \
+                            d_x_terms, d_z_terms + launch_z_offset, \
+                            search_center_x, search_center_z, \
+                            base_x, base_z + launch_z_offset, launch_width, launch_height, \
+                            launch_tiles_x, launch_tiles_z, min_size, max_size, emit_min_size, rd_min_sq, \
+                            d_results, gpu_buffer_cap, d_found_count, d_emitted_count); \
+                        break; \
+                    } \
+                    if (use_group2) { \
+                        search_slime_group2_kernel<T, C, BAND_H, false, R, true><<<launch_blocks, T>>>( \
+                            d_x_terms, d_z_terms + launch_z_offset, \
+                            search_center_x, search_center_z, \
+                            base_x, base_z + launch_z_offset, launch_width, launch_height, \
+                            launch_tiles_x, launch_tiles_z, min_size, max_size, emit_min_size, rd_min_sq, \
+                            d_results, gpu_buffer_cap, d_found_count, d_emitted_count); \
+                        break; \
+                    } \
+                } \
                 if (emit_min_size > min_size) \
                     search_slime_fused_sparse_v1_kernel<T, C, BAND_H, true, R, N><<<launch_blocks, T>>>( \
                         d_x_terms, d_z_terms + launch_z_offset, \
@@ -1236,10 +3488,6 @@ extern "C" {
             return cudaGetLastError();
         };
 
-        int32_t device = 0;
-        cudaDeviceProp prop{};
-        bool have_prop = cudaGetDevice(&device) == cudaSuccess &&
-                         cudaGetDeviceProperties(&prop, device) == cudaSuccess;
         const char* forced = std::getenv("SLIME_GPU_V1_SHAPE");
         if (!forced) forced = std::getenv("SLIME_GPU_V34_SHAPE");
         if (forced && std::strcmp(forced, "128x8") == 0) v1_shape = 1;
@@ -1247,10 +3495,11 @@ extern "C" {
         else if (forced && std::strcmp(forced, "256x8") == 0) v1_shape = 3;
         else if (forced && std::strcmp(forced, "512x4") == 0 &&
                  (!have_prop || prop.maxThreadsPerBlock >= 512)) v1_shape = 4;
+        else if (use_midscale) v1_shape = 3;
         else {
-            static uint8_t tuned_v1[32][2] = {};
+            static uint8_t tuned_v1[32][13] = {};
             int32_t slot = std::max(0, std::min(31, device));
-            int32_t bucket = min_size <= 45 ? 0 : 1;
+            int32_t bucket = use_midscale ? 12 : use_early272 ? 11 : use_strip272 ? 10 : use_scalar_guard4 ? 9 : use_guard4_mid ? 8 : (use_guard4 ? 7 : (use_history ? 6 : (use_unroll4 ? 5 : (use_batch4 ? 4 : (use_group4 ? 3 : (use_group2 ? 2 : (min_size <= 45 ? 0 : 1)))))));
             if (tuned_v1[slot][bucket]) {
                 v1_shape = tuned_v1[slot][bucket];
             } else if ((int64_t)width * height >= 100000000000LL) {
@@ -1344,9 +3593,9 @@ extern "C" {
                                   std::strcmp(forced_rng, "0") == 0)) {
             v1_rng = 0;
         } else {
-            static uint8_t tuned_rng[32][2] = {};
+            static uint8_t tuned_rng[32][13] = {};
             const int32_t slot = std::max(0, std::min(31, device));
-            const int32_t bucket = min_size <= 45 ? 0 : 1;
+            const int32_t bucket = use_midscale ? 12 : use_early272 ? 11 : use_strip272 ? 10 : use_scalar_guard4 ? 9 : use_guard4_mid ? 8 : (use_guard4 ? 7 : (use_history ? 6 : (use_unroll4 ? 5 : (use_batch4 ? 4 : (use_group4 ? 3 : (use_group2 ? 2 : (min_size <= 45 ? 0 : 1)))))));
             if (tuned_rng[slot][bucket] != 0) {
                 v1_rng = (int32_t)tuned_rng[slot][bucket] - 1;
             } else if ((int64_t)width * height >= 100000000000LL) {
@@ -1684,7 +3933,7 @@ extern "C" {
             return;
         }
         if (g_gpu_y_tables_ready) {
-            refine_afk_block_kernel<<<count, REFINE_BLOCK_THREADS>>>(
+            launch_refine_xz_or_original(
                 seed, d_top_results, count,
                 g_platform_y, g_y_count, g_d_y_values,
                 g_d_outer_radius_table, g_d_inner_radius_table,
