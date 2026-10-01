@@ -17,6 +17,8 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+/SlimeFinder.py
+/requirements.txt
 
 # User state and generated artifacts
 settings.json
@@ -34,6 +36,12 @@ tools/
 CONTRIBUTING.md
 THIRD_PARTY.md
 requirements-dev.txt
+optimization_log/
+trial_gpu_proto/
+_ui_preview.png
+/MinecraftGPUNoise.cu
+/gpu_noise/README.md
+/gpu_noise/build_universal.ps1
 
 # Local experiment/legacy snapshots (V34 is the publishable entry point)
 Slime_v2_migrated_v30.py

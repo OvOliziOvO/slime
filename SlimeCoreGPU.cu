@@ -26,6 +26,7 @@ static int32_t g_y_count = 1;
 static int32_t* g_d_y_values = nullptr;
 static int16_t* g_d_outer_radius_table = nullptr;
 static int16_t* g_d_inner_radius_table = nullptr;
+static uint16_t* g_d_refine_chunk_weights = nullptr;
 static int g_gpu_y_tables_ready = 0;
 // 1=128x8, 2=256x4, 3=256x8, 4=512x4.
 static int32_t g_v1_last_shape = 0;
@@ -37,6 +38,8 @@ constexpr int32_t DX_TABLE_MIN = -128;
 constexpr int32_t DX_TABLE_MAX = 128;
 constexpr int32_t DX_TABLE_COUNT = DX_TABLE_MAX - DX_TABLE_MIN + 1;
 constexpr int32_t REFINE_BLOCK_THREADS = 128;
+constexpr int32_t REFINE_ALIGN_COUNT = 4;
+constexpr int32_t REFINE_LOCAL_CHUNKS = 21;
 
 __host__ __device__ __forceinline__ int32_t pack_obs_y(int32_t obs, int32_t y) {
     return obs | ((y + 1024) << 20);
@@ -63,9 +66,11 @@ static void release_gpu_y_tables() {
     if (g_d_y_values) cudaFree(g_d_y_values);
     if (g_d_outer_radius_table) cudaFree(g_d_outer_radius_table);
     if (g_d_inner_radius_table) cudaFree(g_d_inner_radius_table);
+    if (g_d_refine_chunk_weights) cudaFree(g_d_refine_chunk_weights);
     g_d_y_values = nullptr;
     g_d_outer_radius_table = nullptr;
     g_d_inner_radius_table = nullptr;
+    g_d_refine_chunk_weights = nullptr;
     g_gpu_y_tables_ready = 0;
 }
 
@@ -99,6 +104,56 @@ static void rebuild_gpu_y_tables() {
         }
     }
 
+    const size_t weight_count =
+        (size_t)REFINE_ALIGN_COUNT * REFINE_ALIGN_COUNT *
+        REFINE_LOCAL_CHUNKS * REFINE_LOCAL_CHUNKS * (size_t)g_y_count;
+    std::vector<uint16_t> chunk_weights(weight_count, 0);
+    for (int32_t ax_i = 0; ax_i < REFINE_ALIGN_COUNT; ++ax_i) {
+        const int32_t align_x = ax_i * 4;
+        for (int32_t az_i = 0; az_i < REFINE_ALIGN_COUNT; ++az_i) {
+            const int32_t align_z = az_i * 4;
+            const size_t pair_base =
+                (size_t)(ax_i * REFINE_ALIGN_COUNT + az_i) *
+                REFINE_LOCAL_CHUNKS * REFINE_LOCAL_CHUNKS * (size_t)g_y_count;
+            for (int32_t rx = 0; rx < REFINE_LOCAL_CHUNKS; ++rx) {
+                const int32_t chunk_rel_x0 = (rx - 10) * 16 - align_x;
+                for (int32_t rz = 0; rz < REFINE_LOCAL_CHUNKS; ++rz) {
+                    const int32_t chunk_rel_z0 = (rz - 10) * 16 - align_z;
+                    const int32_t chunk_rel_z1 = chunk_rel_z0 + 15;
+                    const size_t cell_base =
+                        pair_base +
+                        (size_t)(rx * REFINE_LOCAL_CHUNKS + rz) * (size_t)g_y_count;
+                    for (int32_t yi = 0; yi < g_y_count; ++yi) {
+                        int32_t total = 0;
+                        const int16_t* outer_y =
+                            outer.data() + (size_t)yi * DX_TABLE_COUNT;
+                        const int16_t* inner_y =
+                            inner.data() + (size_t)yi * DX_TABLE_COUNT;
+                        for (int32_t bx = 0; bx < 16; ++bx) {
+                            const int32_t rel_x = chunk_rel_x0 + bx;
+                            if (rel_x < DX_TABLE_MIN || rel_x > DX_TABLE_MAX) continue;
+                            const int32_t ti = rel_x - DX_TABLE_MIN;
+                            const int32_t ro = outer_y[ti];
+                            if (ro < 0) continue;
+                            const int32_t zl = std::max(chunk_rel_z0, -ro);
+                            const int32_t zr = std::min(chunk_rel_z1, ro);
+                            if (zr < zl) continue;
+                            int32_t add = zr - zl + 1;
+                            const int32_t ri = inner_y[ti];
+                            if (ri >= 0) {
+                                const int32_t il = std::max(zl, -ri);
+                                const int32_t ir = std::min(zr, ri);
+                                if (ir >= il) add -= ir - il + 1;
+                            }
+                            total += add;
+                        }
+                        chunk_weights[cell_base + yi] = (uint16_t)total;
+                    }
+                }
+            }
+        }
+    }
+
     if (cudaMalloc(&g_d_y_values, (size_t)g_y_count * sizeof(int32_t)) != cudaSuccess) {
         release_gpu_y_tables();
         return;
@@ -111,9 +166,16 @@ static void rebuild_gpu_y_tables() {
         release_gpu_y_tables();
         return;
     }
+    if (cudaMalloc(&g_d_refine_chunk_weights,
+                   chunk_weights.size() * sizeof(uint16_t)) != cudaSuccess) {
+        release_gpu_y_tables();
+        return;
+    }
     if (cudaMemcpy(g_d_y_values, y_values.data(), (size_t)g_y_count * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(g_d_outer_radius_table, outer.data(), outer.size() * sizeof(int16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(g_d_inner_radius_table, inner.data(), inner.size() * sizeof(int16_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaMemcpy(g_d_inner_radius_table, inner.data(), inner.size() * sizeof(int16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(g_d_refine_chunk_weights, chunk_weights.data(),
+                   chunk_weights.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess) {
         release_gpu_y_tables();
         return;
     }
@@ -362,7 +424,7 @@ __device__ __forceinline__ void fused_sparse_v1_row(
 ) {
     constexpr int WARPS = TPB / 32;
     constexpr int WORDS = WARPS * CPT;
-    constexpr int STRIDE = WORDS + 1;
+    constexpr int STRIDE = ((WORDS + 4) / 4) * 4;
     const int32_t slot = r & 31;
     const uint64_t zt = seeded_z_terms[z_base + r];
     uint32_t ballots[CPT];
@@ -371,7 +433,17 @@ __device__ __forceinline__ void fused_sparse_v1_row(
         const bool slime = (FULL_X || input_active[k]) &&
                            is_slime_fast_math_seeded_z_variant<RNG_MODE>(xt[k], zt);
         ballots[k] = __ballot_sync(0xFFFFFFFFU, slime);
-        if (lane == 0) rows[slot * STRIDE + k * WARPS + warp] = ballots[k];
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int q = 0; q < CPT; q += 4) {
+            uint4 packed;
+            packed.x = ballots[q + 0];
+            packed.y = ballots[q + 1];
+            packed.z = ballots[q + 2];
+            packed.w = ballots[q + 3];
+            *reinterpret_cast<uint4*>(rows + slot * STRIDE + warp * CPT + q) = packed;
+        }
     }
     __syncthreads();
 
@@ -380,9 +452,10 @@ __device__ __forceinline__ void fused_sparse_v1_row(
     #pragma unroll
     for (int k = 0; k < CPT; ++k) {
         if (!output_active[k]) continue;
-        const int32_t word = k * WARPS + warp;
+        const int32_t word = warp * CPT + k;
+        const uint32_t next_word = (k + 1 < CPT) ? ballots[k + 1] : new_row[word + 1];
         const uint32_t newest = __funnelshift_r(
-            ballots[k], new_row[word + 1], lane) & 0x1FFFFU;
+            ballots[k], next_word, lane) & 0x1FFFFU;
         int32_t square = square_score[k] + __popc(newest);
         if (HAS_OLD) {
             const uint32_t expired = __funnelshift_r(
@@ -392,7 +465,7 @@ __device__ __forceinline__ void fused_sparse_v1_row(
         square_score[k] = square;
 
         if (EMIT && square >= min_size && (NO_UPPER || square <= max_size + 68)) {
-            const int32_t cx = base_x + x_base + (int32_t)threadIdx.x + k * TPB;
+            const int32_t cx = base_x + x_base + (warp * CPT + k) * 32 + lane;
             const int32_t cz = slab_base_z + z_base + (r - 16);
             const int64_t dx64 = (int64_t)cx - (int64_t)search_center_x;
             const int64_t dz64 = (int64_t)cz - (int64_t)search_center_z;
@@ -440,8 +513,8 @@ __global__ __launch_bounds__(TPB) void search_slime_fused_sparse_v1_kernel(
     constexpr int OUT_W = TILE_W - 16;
     constexpr int WARPS = TPB / 32;
     constexpr int WORDS = WARPS * CPT;
-    constexpr int STRIDE = WORDS + 1;
-    __shared__ uint32_t rows[32 * STRIDE];
+    constexpr int STRIDE = ((WORDS + 4) / 4) * 4;
+    __shared__ __align__(16) uint32_t rows[32 * STRIDE];
     __shared__ uint32_t block_found_count;
 
     const int32_t tx = (int32_t)threadIdx.x;
@@ -470,7 +543,7 @@ __global__ __launch_bounds__(TPB) void search_slime_fused_sparse_v1_kernel(
         int32_t square_score[CPT];
         #pragma unroll
         for (int k = 0; k < CPT; ++k) {
-            const int32_t x_local = tx + k * TPB;
+            const int32_t x_local = (warp * CPT + k) * 32 + lane;
             input_active[k] = x_local < tile_in_w;
             output_active[k] = x_local < tile_out_w;
             xt[k] = x_terms[x_base + (input_active[k] ? x_local : 0)];
@@ -712,6 +785,40 @@ __device__ int32_t count_spawnable_union_table_device(
     return count;
 }
 
+__device__ __forceinline__ int32_t count_spawnable_union_weight_device(
+    const uint32_t union_cache[23], int64_t union_base_cx, int64_t union_base_cz,
+    int64_t base_cx, int64_t base_cz, int64_t ox, int64_t oz,
+    int32_t yi, int32_t y_count, const uint16_t* chunk_weights
+) {
+    const int32_t align_x = (int32_t)ox & 15;
+    const int32_t align_z = (int32_t)oz & 15;
+    if ((align_x & 3) != 0 || (align_z & 3) != 0 || !chunk_weights) return -1;
+
+    const int32_t x_offset = (int32_t)(base_cx - union_base_cx);
+    const int32_t z_shift = (int32_t)(base_cz - union_base_cz);
+    if (x_offset < 0 || x_offset > 2 || z_shift < 0 || z_shift > 2) return -1;
+
+    const int32_t pair = (align_x >> 2) * REFINE_ALIGN_COUNT + (align_z >> 2);
+    const size_t pair_base =
+        (size_t)pair * REFINE_LOCAL_CHUNKS * REFINE_LOCAL_CHUNKS * (size_t)y_count;
+
+    int32_t count = 0;
+    #pragma unroll
+    for (int32_t i = 0; i < REFINE_LOCAL_CHUNKS; ++i) {
+        uint32_t row = (union_cache[x_offset + i] >> z_shift) & 0x1FFFFFu;
+        while (row) {
+            const int32_t j = __ffs(row) - 1;
+            row &= row - 1;
+            const size_t wi =
+                pair_base +
+                (size_t)(i * REFINE_LOCAL_CHUNKS + j) * (size_t)y_count +
+                (size_t)yi;
+            count += (int32_t)chunk_weights[wi];
+        }
+    }
+    return count;
+}
+
 __global__ void refine_afk_kernel(
     int64_t seed, ExtChunkResult* d_top_results, int32_t count,
     int32_t y_scan_enabled, int32_t platform_y, int32_t y_min, int32_t y_max, int32_t y_step
@@ -752,7 +859,8 @@ __global__ void refine_afk_kernel(
 __global__ void refine_afk_block_kernel(
     int64_t seed, ExtChunkResult* d_top_results, int32_t count,
     int32_t platform_y, int32_t y_count, const int32_t* y_values,
-    const int16_t* outer_radius_table, const int16_t* inner_radius_table
+    const int16_t* outer_radius_table, const int16_t* inner_radius_table,
+    const uint16_t* chunk_weights
 ) {
     int idx = blockIdx.x;
     int tid = threadIdx.x;
@@ -808,9 +916,14 @@ __global__ void refine_afk_block_kernel(
         for (int32_t yi = tid; yi < safe_y_count; yi += blockDim.x) {
             const int16_t* outer = outer_radius_table + (size_t)yi * DX_TABLE_COUNT;
             const int16_t* inner = inner_radius_table + (size_t)yi * DX_TABLE_COUNT;
-            int32_t obs = count_spawnable_union_table_device(
+            int32_t obs = count_spawnable_union_weight_device(
                 union_cache, union_base_cx_s, union_base_cz_s,
-                base_cx, base_cz, ox, oz, outer, inner);
+                base_cx, base_cz, ox, oz, yi, safe_y_count, chunk_weights);
+            if (obs < 0) {
+                obs = count_spawnable_union_table_device(
+                    union_cache, union_base_cx_s, union_base_cz_s,
+                    base_cx, base_cz, ox, oz, outer, inner);
+            }
             int32_t order = off * safe_y_count + yi;
             if (obs > local_best_obs || (obs == local_best_obs && order < local_best_order)) {
                 local_best_obs = obs;
@@ -820,7 +933,6 @@ __global__ void refine_afk_block_kernel(
                 local_best_y = y_values[yi];
             }
         }
-        __syncthreads();
     }
 
     s_best_obs[tid] = local_best_obs;
@@ -937,11 +1049,21 @@ extern "C" {
     }
 
     __declspec(dllexport) void set_y_scan_config(int32_t enabled, int32_t platform_y, int32_t y_min, int32_t y_max, int32_t y_step) {
-        g_y_scan_enabled = enabled ? 1 : 0;
+        const int32_t next_enabled = enabled ? 1 : 0;
+        const int32_t next_step = y_step > 0 ? y_step : 4;
+        if (g_gpu_y_tables_ready &&
+            g_y_scan_enabled == next_enabled &&
+            g_platform_y == platform_y &&
+            g_y_min == y_min &&
+            g_y_max == y_max &&
+            g_y_step == next_step) {
+            return;
+        }
+        g_y_scan_enabled = next_enabled;
         g_platform_y = platform_y;
         g_y_min = y_min;
         g_y_max = y_max;
-        g_y_step = y_step > 0 ? y_step : 4;
+        g_y_step = next_step;
         rebuild_gpu_y_tables();
     }
 
@@ -1485,7 +1607,8 @@ extern "C" {
                         if (g_y_scan_enabled && g_gpu_y_tables_ready) {
                             refine_afk_block_kernel<<<eval_count, REFINE_BLOCK_THREADS>>>(
                                 seed, d_top, eval_count, g_platform_y, g_y_count, g_d_y_values,
-                                g_d_outer_radius_table, g_d_inner_radius_table);
+                                g_d_outer_radius_table, g_d_inner_radius_table,
+                                g_d_refine_chunk_weights);
                         } else {
                             int32_t blocks = (eval_count + 127) / 128;
                             refine_afk_kernel<<<blocks, 128>>>(
@@ -1564,7 +1687,8 @@ extern "C" {
             refine_afk_block_kernel<<<count, REFINE_BLOCK_THREADS>>>(
                 seed, d_top_results, count,
                 g_platform_y, g_y_count, g_d_y_values,
-                g_d_outer_radius_table, g_d_inner_radius_table
+                g_d_outer_radius_table, g_d_inner_radius_table,
+                g_d_refine_chunk_weights
             );
         } else {
             int threads_per_block = 128;

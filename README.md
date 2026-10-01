@@ -1,139 +1,221 @@
-# Slime Finder V1
+# Slime Finder
 
-Minecraft Java Edition 史莱姆区块聚集搜索器。支持 CUDA / AVX2、精准挂机点与 Y 扫描、排名、历史记录和 Litematica 地板投影。
+Minecraft Java Edition 高性能史莱姆农场选址工具。
 
-史莱姆搜索使用精确 Java LCG 与精确圆形统计，不使用概率近似。
+用于在大范围乃至整个 Java 世界中搜索史莱姆区块聚集区域，并进一步执行精确挂机范围统计、挂机 Y 扫描、最终候选排名与群系过滤。
 
-## 下载
+- NVIDIA CUDA / AVX2
+- 精确 Java 48-bit LCG
+- 精确 221 区块挂机圆形统计
+- Top-N 最终候选排名
+- Deep Dark / Mushroom Fields 群系过滤
+- Litematica 地板投影
+- GPU shape / RNG 自动选择
 
-主程序：[Releases](https://github.com/OvOliziOvO/slime/releases/latest)
+> 史莱姆搜索核心完整保留 Java `nextInt(10)` rejection 语义，不使用概率近似或抽样换速度。
 
-统一 EXE：`SlimeFinder_NVIDIA_10_50.exe`，覆盖 GTX 10 / RTX 20 / RTX 30 / RTX 40 / RTX 50 系。
+## 性能
 
-## GPU 性能
+测试设备：**RTX 3060 Laptop GPU**
 
-测试设备：RTX 3060 Laptop GPU。
+测试条件：`threshold=60`，CUDA shape / RNG 自动选择。
 
-**GPU速度统计：全图：峰值 140.71 B/s | 最低 91.00 B/s | 平均 104.06 B/s**
+| 搜索范围 | 候选中心 | 端到端时间 | 端到端吞吐 | 纯 GPU 平均 |
+|---|---:|---:|---:|---:|
+| 半径 500,000 | 1.000 T | **7.705 s** | **129.794 B/s** | **151.056 B/s** |
+| Java 全图 | 14.063 T | **95.961 s** | **146.544 B/s** | **148.394 B/s** |
 
 `B/s` 表示每秒检查十亿个候选中心。
 
-## V1 算法
+该设备的全图持续扫描区间约为 **147 ～ 151 B/s**。实际速度会受 GPU 型号、功耗限制、温度和搜索条件影响。
 
-- 32 行共享内存压缩位图，Warp ballot 直接生成史莱姆结果。
-- 17×17 滚动方形计数作为严格上界。
-- 精确圆形使用 `289 - 68 = 221`，只扣除圆外角落。
-- 完整保留 Java `nextInt(10)` rejection 语义。
-- Native / Limb32 / Truncated 三条精确 RNG 路径自动短测。
-- 128×8 / 256×4 / 256×8 / 512×4 四种 CUDA 线程形状自动选择。
-- GPU 负责大范围扫描与 Top-K，CPU/Python 负责后处理和可选世界生成检查。
+## 主要功能
 
-调试环境变量：
+### 大范围搜索
 
-```powershell
-$env:SLIME_GPU_V1_SHAPE = "256x4"
-$env:SLIME_GPU_V1_RNG = "native"
+支持指定中心 / 半径搜索，也支持 Java 世界边界范围的全图扫描。
+
+GPU 主扫描完整处理搜索区域，不通过随机抽样缩小搜索空间。
+
+### 精确挂机范围
+
+候选首先使用 17×17 方形作为严格上界，最终结果使用精确圆形：
+
+```text
+17 × 17 = 289
+圆外角落 = 68
+精确圆形 = 221
 ```
 
-## 噪声 / 群系检查
+因此方形只用于快速淘汰，不会代替最终圆形结果。
 
-史莱姆区块搜索本身不需要 `cubiomes.dll`。深谙之域、蘑菇岛等检查需要外置噪声组件。
+### 精准评分与 Y 扫描
 
-| Minecraft 支持范围 | 下载 |
-|---|---|
-| 1.19 ～ 26.2 | [cubiomes_latest_26.2.zip](https://github.com/OvOliziOvO/slime/releases/latest/download/cubiomes_latest_26.2.zip) |
+可对高排名候选继续进行精准挂机点评分，并搜索更优的挂机 Y。
 
-下载后解压，把 `cubiomes.dll` 放到 EXE 或 `SlimeFinder.py` 同目录。ZIP 内附 cubiomes 的 MIT License。当前新版 DLL 只依赖 Windows 系统库，不需要额外的 `libwinpthread-1.dll`。
+GPU 最终精准评分使用大批量原生计算，默认可一次处理最多 20,000 个候选，减少 Python / CUDA 往返。
 
-### 为什么噪声检查比 GPU 搜索慢？
+末尾阶段会显示当前批次的：
 
-GPU 主扫描主要是整数 RNG、位图和 popcount；噪声检查则要在 CPU 上运行 Minecraft 世界生成与群系逻辑，并对候选周围多个 Y 和完整 quart 位置进行验证，所以单个候选的成本高很多。
+```text
+候选数量 / 批次耗时 / 候选每秒 / ETA
+```
 
-当前流程会先完成 V1 精准排名，再从高到低做群系检查，凑够最终 Top-N 后立即停止。
+UI 状态刷新限制在约 5 Hz，避免高速批处理时频繁刷新文本。
+
+### 群系过滤
+
+史莱姆区块 RNG 搜索本身不依赖 cubiomes。
+
+群系过滤根据当前运行模式分开：
+
+- **CPU 模式**：调用外置 `cubiomes.dll`
+- **GPU 模式**：调用内置 CUDA 噪声后端
+
+两条路径不会静默互相回退。
+
+GPU 后端可执行 Deep Dark / Mushroom Fields 精确过滤，并根据当前 GPU 的 occupancy 调整候选批次。
+
+当前群系版本范围：**Minecraft Java 1.19 ～ 26.2**。
+
+### Litematica 投影
+
+支持根据最终挂机点与筛选结果生成地板 / 结构辅助投影，用于游戏内定位和建造。
 
 ## 正确性
 
-当前回归覆盖 CPU/GPU 结果集合、三条 GPU RNG、Y 精准评分、候选缓冲、深谙/蘑菇岛过滤、投影坐标与保存/重载。
+性能优化不通过近似 RNG、概率模型或抽样改变结果。
 
-最近完整回归：
+当前回归覆盖：
+
+- 4 种 CUDA shape
+- 3 条精确 RNG 路径
+- 正 / 负 Java seed
+- signed 64-bit 边界
+- 精确圆形统计
+- Y 精准评分
+- 候选缓冲扩容
+- Deep Dark / Mushroom Fields
+- CPU / GPU 结果集合
+- 投影坐标与 3D 范围
+
+当前完整回归包括：
 
 ```text
 ACCURACY_AUDIT_OK
 CPU_GPU_MATRIX_OK
-MUSHROOM_FAST_MISMATCH 0
-DEEP_FAST_MISMATCH 0
-BUFFER_INTEGRITY_OK
-PROJECTION_ROUNDTRIP_OK
+GPU_NOISE_MATRIX_EXACT 57344
+GPU_NOISE_VERSION_FILTER_OK
+FRONTEND_SMOKE_OK
 ```
 
-## 源码
+## 算法源码
 
-- `SlimeCoreGPU.cu`：V1 CUDA 搜索核心。
-- `SlimeCore.cpp`：AVX2/OpenMP CPU 核心。
-- `SlimeFinder.py`：PyQt6 前端、排名、群系检查与投影。
+公开仓库只保留算法核心与必要的许可证 / 数据表，不包含 GUI 前端源码、测试日志、benchmark 记录或本地实验文件。
 
-从源码运行：
+主要源码：
 
-```powershell
-python -m pip install -r requirements.txt
-python .\SlimeFinder.py
+- `SlimeCoreGPU.cu` — CUDA 史莱姆搜索核心
+- `SlimeCore.cpp` — AVX2 / OpenMP 史莱姆搜索核心
+- `gpu_noise/MinecraftGPUNoise.cu` — CUDA Deep Dark / Mushroom Fields 噪声过滤核心
+- `gpu_noise/mcgpu.h` — GPU 噪声接口 / 公共定义
+- `gpu_noise/spline_generated.cuh` — GPU 世界生成 spline 数据
+- `gpu_noise/tables/` — 群系 decision-tree 数据
+
+## 第三方组件与许可证
+
+CPU 群系模式使用外置 `cubiomes.dll`；该组件不打包进源码仓库。
+
+GPU 噪声实现中使用 / 适配了 cubiomes 的部分群系 decision-tree 数据与相关逻辑。对应 MIT 许可证保留在：
+
+```text
+gpu_noise/LICENSE.cubiomes
 ```
 
-`cubiomes.dll` 不打包进 Release EXE；其源码与许可归对应上游项目所有。
+相关部分的版权与许可证归其原项目所有。
 
 ---
 
-## 为什么这么快？
+# 为什么这么快？
 
-最直接的史莱姆密集区搜索会对每一个候选中心重新判断周围圆形范围内的 221 个区块。相邻两个中心的范围却几乎完全重叠，所以这种写法会把同一批 Java Random / LCG 判定重复计算很多次。
+## 1. Warp ballot 生成压缩史莱姆位图
 
-V1 的核心思路不是让一次 LCG 神奇地快几百倍，而是尽量让**每一个底层区块只计算一次，然后把结果复用给附近所有候选中心**。
+CUDA Warp 的 32 个线程分别判断 32 个区块，再通过 `ballot` 直接压成一个 32-bit 位图。
 
-### 1. 先生成压缩史莱姆位图
+后续窗口统计操作位图，而不是把每个区块结果存成普通整数 / bool 再逐项读取。
 
-CUDA Warp 的 32 个线程分别判断 32 个区块是否为史莱姆区块，然后用 `ballot` 直接压成一个 32 位整数。后续窗口统计处理的是位图，而不是一大堆普通整数或布尔数组。
+## 2. Warp-contiguous shared layout
 
-最近 32 行位图保存在 CUDA Block 的共享内存环中。相邻候选使用的大部分数据都已经在共享内存和寄存器里，因此不需要把整张地图写进显存后再反复读取。
+同一 Warp 生成的多个 ballot 连续存放在 shared memory 中。
 
-### 2. 17×17 方形滚动，不重新数 289 格
+横向 17-bit 窗口需要相邻 word 时，同 Warp 内优先直接复用寄存器中的 ballot；只有跨 Warp 边界才读取 shared memory。
 
-圆形有效范围位于 17×17 方形之内。候选中心横向移动一格时，旧窗口和新窗口有 16 列完全重合，所以程序只更新离开的那一列和新进入的那一列。
+这减少了热路径中的共享内存往返，同时不增加 RNG 次数或 CTA barrier。
 
-这样可以快速得到 17×17 方形分数。因为圆形一定不可能比方形更多，所以如果方形分数都低于用户要求，该中心可以直接淘汰，而且不会漏掉任何正确结果。
+## 3. 17×17 rolling window
 
-### 3. 精确圆形只扣 68 个角落
+相邻候选中心的范围高度重叠。
 
-17×17 方形共有 289 格，而程序定义的精确圆形共有 221 格，因此：
+当窗口横向移动一格时，大部分列完全复用，只更新离开窗口和新进入窗口的部分，而不是重新统计全部 289 格。
+
+方形分数还是精确圆形的严格上界，因此低于阈值时可以立即淘汰。
+
+## 4. 精确圆形只扣 68 个角落
+
+精确圆形共有 221 格：
 
 ```text
-圆形分数 = 289 格方形分数 - 68 格圆外角落分数
+circle = square_score - outside_corners
+221 = 289 - 68
 ```
 
-通过方形上界的候选不需要重新统计圆内 221 格，只需要从已经得到的方形分数中扣掉角落。角落还是分批计算的，只要中途已经可以证明最终结果不可能进入用户要求的范围，就提前结束。
+通过方形上界的候选不重新计算圆内 221 格，只从已有方形分数中扣除圆外角落。
 
-### 4. Java RNG 仍然是精确语义
+角落分阶段计算，只要中途已经能严格证明候选无法达到要求，就提前结束。
 
-史莱姆区块判定保持 Java 48 位 LCG 与 `nextInt(10)` 的行为。常见路径做了整数化和不变量预计算，但极低概率出现的 rejection 分支没有删除。
+## 5. 精确 Java RNG 多路径
 
-V1 同时编译 Native 48 位、Limb32 和 Truncated 三条等价 RNG 路径。不同 NVIDIA 架构对整数运算的代价不同，所以大范围搜索时会在当前设备上短测并选择更快的一条，而不是硬编码“某一种永远最快”。
+CUDA 核心同时提供：
 
-### 5. 不把海量候选全传回 CPU
+- Native 48-bit
+- Limb32
+- Truncated first-output
 
-低阈值搜索可能命中非常多的中心，但最终用户通常只需要 Top-N。GPU 会精确统计命中，同时只物化真正可能进入最终排名的候选，避免把几千万甚至更多坐标经过 PCIe 全部传给 Python 再排序。
+三条路径保持相同 Java RNG 语义，并保留极低概率 rejection fallback。
 
-地图还会按 Slab 分段处理。某一段候选过多时可以缩小分段或降低物化门槛后重新精确补扫，因此省掉的是无意义的数据传输和排序，不是省掉搜索区域。
+不同 NVIDIA 架构的整数运算代价不同，因此程序会根据当前 GPU 自动选择更合适的实现。
 
-### 6. 为什么 GPU 搜索能比噪声检查快很多？
+## 6. GPU 自动选择线程形状
 
-史莱姆主扫描的大部分工作最终都变成规则的整数运算、位运算、`ballot` 和 `popcount`，非常适合 GPU 大规模并行。
+当前搜索核心可在以下 CUDA shape 中自动选择：
 
-深谙之域和蘑菇岛检查则不同：它们要在 CPU 上运行 Minecraft 世界生成的噪声和群系逻辑，还需要针对候选周围多个高度和完整 quart 位置进行验证。两者虽然都显示在同一个程序里，但计算性质完全不同，所以出现“GPU 主扫描几秒、群系检查反而更久”并不矛盾。
+```text
+128×8
+256×4
+256×8
+512×4
+```
 
-### 7. 快速路径没有牺牲结果准确性
+不会假设某一个线程形状在所有显卡上都最快。
 
-- 方形阶段只是严格上界筛选。
-- 圆形阶段使用 `square - corners` 的精确恒等关系。
-- Java `nextInt(10)` rejection 仍然保留。
-- CPU、GPU 三条 RNG、Y 精准评分和群系过滤都有交叉回归测试。
+## 7. 减少 PCIe 与 Python 搬运
 
-因此 V1 的速度主要来自**复用、压缩、滚动统计、提前淘汰和减少数据搬运**，而不是用抽样或近似换速度。
+低阈值下可能出现大量命中，但最终通常只需要 Top-N。
+
+GPU 会完成精确统计，同时只物化真正有机会进入最终结果的候选，避免把大量坐标全部通过 PCIe 传回 Python 再排序。
+
+搜索也采用分段处理，降低候选缓冲与主机端数据搬运压力。
+
+## 8. 最终群系过滤也使用 GPU
+
+Deep Dark / Mushroom Fields 的世界生成噪声和史莱姆 RNG 是两类完全不同的计算，因此使用独立 CUDA 后端。
+
+GPU 群系 kernel 会先找出精确范围内真正需要检查的史莱姆区块，再把有效区块压紧成连续工作列表，让 CUDA block 集中处理实际需要的噪声查询。
+
+这样可以减少 Warp 中大量无效 lane。
+
+在 RTX 3060 Laptop GPU 的测试中，新的 compact 调度对不同过滤组合有明显收益；GPU 群系结果同时与 cubiomes 参考实现进行了交叉验证。
+
+---
+
+速度主要来自 **结果复用、位图压缩、滚动统计、严格上界提前淘汰、连续 GPU 工作调度和减少数据搬运**，而不是牺牲搜索准确性。
