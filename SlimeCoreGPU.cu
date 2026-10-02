@@ -32,6 +32,7 @@ static int g_gpu_y_tables_ready = 0;
 static int32_t g_v1_last_shape = 0;
 // 0=native 48-bit LCG, 1=32-bit limbs, 2=truncated first-output LCG.
 static int32_t g_v1_last_rng = 0;
+static int32_t g_v1_last_algorithm = -1;
 static int32_t g_v1_rng_override = -1;
 
 constexpr int32_t DX_TABLE_MIN = -128;
@@ -1618,7 +1619,7 @@ __global__ __launch_bounds__(TPB, 1024 / TPB) void search_slime_history_kernel(
 }
 // Group four exact first outputs under one rare-rejection guard. If any
 // first output is rejected, recompute with the original exact Java helper.
-// Enable only for the measured CC8.6 / 256x8 / native search configuration.
+// Use native RNG with the 256x8 search configuration.
 template <int TPB, int CPT, bool DENSE_COUNT, int RNG_MODE,
           bool HAS_OLD, bool EMIT, bool FULL_X, bool NO_UPPER>
 __device__ __forceinline__ void fused_sparse_v1_guard4_row(
@@ -2997,7 +2998,21 @@ __global__ void refine_afk_xz_kernel(
     }
 }
 
-// Measured single-Y exact XZ scoring. Keep all multi-Y schedules intact.
+// Query the actual compiled kernel on this CUDA device. An architecture
+// number is not a prerequisite for these portable integer/shared-memory kernels.
+template <typename Kernel>
+static bool kernel_launchable(Kernel kernel, int threads) {
+    int blocks = 0;
+    const cudaError_t status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks, kernel, threads, 0);
+    if (status != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return blocks > 0;
+}
+
+// Single-Y exact XZ scoring. Keep all multi-Y schedules intact.
 static void launch_refine_xz_or_original(
     int64_t seed, ExtChunkResult* results, int32_t count,
     int32_t platform_y, int32_t y_count, const int32_t* y_values,
@@ -3006,10 +3021,7 @@ static void launch_refine_xz_or_original(
     const char* setting=std::getenv("SLIME_GPU_REFINE_XZ_PARALLEL");
     bool enabled=y_count==1 && (!setting || std::strcmp(setting,"0")!=0);
     if(enabled) {
-        int device=0;cudaDeviceProp prop{};
-        enabled=cudaGetDevice(&device)==cudaSuccess &&
-            cudaGetDeviceProperties(&prop,device)==cudaSuccess &&
-            prop.major==8 && prop.minor==6;
+        enabled=kernel_launchable(refine_afk_xz_kernel,REFINE_BLOCK_THREADS);
     }
     if(enabled)
         refine_afk_xz_kernel<<<count,REFINE_BLOCK_THREADS>>>(seed,results,count,
@@ -3050,6 +3062,11 @@ extern "C" {
 
     __declspec(dllexport) int32_t get_gpu_v1_shape() {
         return g_v1_last_shape;
+    }
+
+    // Actual selected main kernel, after shape/RNG tuning; -1 means no scan yet.
+    __declspec(dllexport) int32_t get_gpu_v1_algorithm() {
+        return g_v1_last_algorithm;
     }
 
     __declspec(dllexport) int32_t get_gpu_v1_rng() {
@@ -3271,24 +3288,26 @@ extern "C" {
         cudaDeviceProp prop{};
         bool have_prop = cudaGetDevice(&device) == cudaSuccess &&
                          cudaGetDeviceProperties(&prop, device) == cudaSuccess;
-        // Enable by default only on measured CC8.6 devices. Other generations
-        // retain the previous kernel and local shape/RNG tuning.
+        // All compiled architectures may participate. Check real kernel
+        // resources, then retain per-device shape/RNG measurement below.
+        const bool history_available=have_prop && kernel_launchable(
+            search_slime_history_kernel<256,8,BAND_H,false,0,true>,256);
+        const bool guard4_available=have_prop && kernel_launchable(
+            search_slime_guard4_kernel<256,8,BAND_H,false,0,true>,256);
         const char* history_setting=std::getenv("SLIME_GPU_V1_HISTORY");
-        const bool use_history=use_unroll4 && (history_setting
-            ? std::strcmp(history_setting,"0")!=0
-            : have_prop && prop.major==8 && prop.minor==6);
+        const bool use_history=use_unroll4 && history_available &&
+            (!history_setting || std::strcmp(history_setting,"0")!=0);
         const char* guard4_setting=std::getenv("SLIME_GPU_V1_GUARD4");
-        const bool use_guard4=use_history && (guard4_setting
-            ? std::strcmp(guard4_setting,"0")!=0
-            : have_prop && prop.major==8 && prop.minor==6);
-        // Thresholds55..59 reuse the exact Guard4 kernel only in the
-        // measured CC8.6/native/256x8 configuration. Keep tuning independent
+        const bool use_guard4=use_history && guard4_available &&
+            (!guard4_setting || std::strcmp(guard4_setting,"0")!=0);
+        // Thresholds55..59 reuse exact Guard4 with native/256x8.
+        // Keep tuning independent
         // from the old fused path and the threshold60+ Guard4 workload.
         const char* guard4_mid_setting=std::getenv("SLIME_GPU_V1_GUARD4_MID");
         const auto path_enabled=[](const char* value) {
             return !value || std::strcmp(value,"0")!=0;
         };
-        // Measured smaller-area route (1M..100B, thresholds55..60, CC8.6).
+        // Smaller-area route (1M..100B, thresholds55..60).
         // Keep the old short-search default for alternate RNG overrides.
         const char* midscale_rng=std::getenv("SLIME_GPU_V1_RNG");
         if (!midscale_rng) midscale_rng=std::getenv("SLIME_GPU_V34_RNG");
@@ -3297,9 +3316,16 @@ extern "C" {
              std::strcmp(midscale_rng,"baseline")==0 || std::strcmp(midscale_rng,"0")==0);
         const char* midscale_setting=std::getenv("SLIME_GPU_V1_MIDSCALE");
         const int64_t v1_area=(int64_t)width*height;
+        const bool strip272_available=have_prop && min_size>=55 && min_size<=59 &&
+            kernel_launchable(search_slime_strip272_kernel<256,8,BAND_H,false,0,true>,256);
+        const bool early272_available=have_prop && min_size==60 &&
+            kernel_launchable(search_slime_early3_kernel<256,8,BAND_H,false,0,true>,256);
+        const bool scalar_guard4_available=have_prop && min_size==40 &&
+            kernel_launchable(search_slime_scalar_guard4_kernel<128,8,BAND_H,false,0,true>,128) &&
+            kernel_launchable(search_slime_scalar_guard4_kernel<128,8,BAND_H,true,0,true>,128);
         const bool use_midscale=min_size>=55 && min_size<=60 && max_size>=221 &&
             v1_area>=1000000LL && v1_area<100000000000LL &&
-            have_prop && prop.major==8 && prop.minor==6 &&
+            guard4_available && (min_size==60 ? early272_available : strip272_available) &&
             path_enabled(group2_setting) && path_enabled(group4_setting) &&
             path_enabled(batch4_setting) && path_enabled(unroll4_setting) &&
             path_enabled(history_setting) && path_enabled(guard4_setting) &&
@@ -3308,7 +3334,7 @@ extern "C" {
              path_enabled(guard4_mid_setting) && path_enabled(std::getenv("SLIME_GPU_V1_STRIP272")));
         const bool use_guard4_mid=min_size>=55 && min_size<60 && max_size>=221 &&
             ((int64_t)width*height>=100000000000LL || use_midscale) &&
-            have_prop && prop.major==8 && prop.minor==6 &&
+            guard4_available &&
             path_enabled(group2_setting) && path_enabled(group4_setting) &&
             path_enabled(batch4_setting) && path_enabled(unroll4_setting) &&
             path_enabled(history_setting) && path_enabled(guard4_setting) &&
@@ -3318,18 +3344,18 @@ extern "C" {
         const char* scalar_guard4_setting=std::getenv("SLIME_GPU_V1_SCALAR_GUARD4");
         const bool use_scalar_guard4=min_size==40 && max_size>=221 &&
             (int64_t)width*height>=100000000000LL &&
-            have_prop && prop.major==8 && prop.minor==6 &&
+            scalar_guard4_available &&
             path_enabled(guard4_setting) && path_enabled(scalar_guard4_setting);
         const char* strip272_setting=std::getenv("SLIME_GPU_V1_STRIP272");
         const bool use_strip272=min_size>=55 && min_size<=59 &&
             (use_guard4_mid || use_guard4) &&
-            have_prop && prop.major==8 && prop.minor==6 &&
+            strip272_available &&
             path_enabled(strip272_setting);
         const char* early272_setting=std::getenv("SLIME_GPU_V1_EARLY272");
         const bool use_early272=min_size==60 && max_size>=221 &&
             ((int64_t)width*height>=100000000000LL || use_midscale) &&
             (use_guard4 || use_midscale) &&
-            have_prop && prop.major==8 && prop.minor==6 &&
+            early272_available &&
             path_enabled(early272_setting);
         auto launch_v1 = [&](int32_t shape, int32_t rng_variant,
                               int32_t launch_z_offset,
@@ -3689,6 +3715,13 @@ extern "C" {
             }
         }
         g_v1_last_rng = v1_rng;
+        g_v1_last_algorithm =
+            v1_rng==0 && v1_shape==1 && use_scalar_guard4 ? 9 :
+            v1_rng==0 && v1_shape==3 && use_early272 ? 11 :
+            v1_rng==0 && v1_shape==3 && use_strip272 ? 10 :
+            v1_rng==0 && v1_shape==3 && (use_guard4_mid || use_guard4) ? 7 :
+            use_history ? 6 : use_unroll4 ? 5 : use_batch4 ? 4 :
+            use_group4 ? 3 : use_group2 ? 2 : 0;
 
         const int32_t tiles_x = (width + out_tile_width - 1) / out_tile_width;
         bool failed = false;
