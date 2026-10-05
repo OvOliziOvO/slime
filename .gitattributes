@@ -1,0 +1,8 @@
+# Keep CUDA files classified as CUDA in GitHub Linguist.
+*.cu linguist-language=Cuda
+
+# These are third-party/adapted biome decision-tree data from cubiomes.
+gpu_noise/tables/** linguist-vendored
+
+# Generated spline data should not dominate the repository language statistics.
+gpu_noise/spline_generated.cuh linguist-generated=true
