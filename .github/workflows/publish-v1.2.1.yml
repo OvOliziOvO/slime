@@ -56,9 +56,38 @@ jobs:
             Get-Process -Name $name -ErrorAction SilentlyContinue | Stop-Process -Force
           }
 
+  linux-build:
+    needs: stage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install build and Qt dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-13 libegl1 libgl1 libxcb-cursor0
+          python -m pip install numpy PyQt6 pyinstaller
+      - name: Build and test the Linux package
+        run: |
+          python release-build/prepare_linux.py
+          bash release-build/build_linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-package
+          path: linux-dist/*
+          if-no-files-found: error
+          compression-level: 0
+
   publish:
     if: github.event.head_commit.message == 'Publish SlimeFinder V1.2.1 for Windows and Linux'
-    needs: [stage, windows-smoke]
+    needs: [stage, windows-smoke, linux-build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -72,12 +101,18 @@ jobs:
         with:
           name: release-assets
           path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-package
+          path: dist
       - name: Verify the release assets and checksum manifest
         shell: bash
         run: |
           set -euo pipefail
           test -s dist/SlimeFinder_V1.2.1_Windows_x64.exe
           test -s dist/SlimeFinder_V1.2.1_Linux_x86_64.tar.gz
+          cat dist/linux-sha256.txt >> dist/SHA256SUMS.txt
+          rm dist/linux-sha256.txt
           test -s dist/SlimeFinder_V1.2.1_CUDA_Source.zip
           gh release download V1.2 --repo "$GITHUB_REPOSITORY" --dir dist --pattern cubiomes_latest_26.2.zip
           printf '%s\n' '798512aea77dc4345643454cd92af2d1440e7dd311fd501a0f7dc134928aa8f3  cubiomes_latest_26.2.zip' >> dist/SHA256SUMS.txt
