@@ -6,6 +6,18 @@ Minecraft Java 版史莱姆农场选址工具。输入世界种子，在指定�
 
 **[下载 V1.2 Windows x64 EXE](https://github.com/OvOliziOvO/slime/releases/download/V1.2/SlimeFinder_V1.2_Windows_x64.exe)** · [V1.2 发布页](https://github.com/OvOliziOvO/slime/releases/tag/V1.2)
 
+[快速开始](#快速开始) · [算法优化](benchmarks/algorithm-optimizations.zh-CN.md)
+
+## 全图速度
+
+| 标准全图 · 阈值 60 | 用时 | 等效吞吐 |
+| --- | ---: | ---: |
+| 纯 GPU 扫描，单次最快 | **9.979 秒** | **1.409 T/s** |
+| 纯 GPU 扫描，三轮中位 | 10.042 秒 | 1.400 T/s |
+| V1.2 搜索全流程，含排名和出图 | 10.531 秒 | 1.335 T/s |
+
+全图共 **14.06 万亿个候选中心**。成绩来自 RTX 3060 Laptop 的 Linux 复测，T/s 表示每秒检查的万亿个候选中心。
+
 ## 能做什么
 
 | 功能 | 用法 |
@@ -28,8 +40,8 @@ Auto 会优先使用可用的 NVIDIA CUDA，否则尝试 AVX2 CPU 路径。GPU �
 
 ## 优化历程
 
-![从约 270 B/s 开始的 SlimeFinder 优化历程，各节点标有对应的算法改动](benchmarks/optimization-history.zh-CN.svg)
+[![从约 270 B/s 开始的 SlimeFinder 优化历程，各节点标有对应的算法改动](benchmarks/optimization-history.zh-CN.svg)](benchmarks/algorithm-optimizations.zh-CN.md)
 
 各点记录开发过程中的历史吞吐，测试条件随阶段而异。B/s 表示每秒检查的十亿个候选中心。
 
-[CUDA 搜索源码与构建说明](https://github.com/OvOliziOvO/slime/tree/main/cuda_x2_z15)
+[看每一步省了什么计算](benchmarks/algorithm-optimizations.zh-CN.md)

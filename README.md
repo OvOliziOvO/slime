@@ -6,6 +6,18 @@ Find a site for your slime farm in Minecraft Java Edition. Enter a world seed, s
 
 **[Download the V1.2 Windows x64 EXE](https://github.com/OvOliziOvO/slime/releases/download/V1.2/SlimeFinder_V1.2_Windows_x64.exe)** · [V1.2 release](https://github.com/OvOliziOvO/slime/releases/tag/V1.2)
 
+[Quick start](#quick-start) · [Algorithm optimizations](benchmarks/algorithm-optimizations.en.md)
+
+## Full-world search speed
+
+| Standard full-world search at threshold 60 | Time | Effective throughput |
+| --- | ---: | ---: |
+| GPU scan, fastest single run | **9.979 s** | **1.409 T/s** |
+| GPU scan, median of three runs | 10.042 s | 1.400 T/s |
+| V1.2 full search, including ranking and rendering | 10.531 s | 1.335 T/s |
+
+A full world has **14.06 trillion candidate centers**. Measured on Linux with an RTX 3060 Laptop GPU. T/s means trillion candidate centers per second.
+
 ## Features
 
 | Feature | What you can do |
@@ -28,8 +40,8 @@ To filter biomes on the CPU, extract `cubiomes.dll` into the EXE folder. [Downlo
 
 ## Optimization history
 
-![SlimeFinder development throughput from approximately 270 B/s, with the change marked at each milestone](benchmarks/optimization-history.en.svg)
+[![SlimeFinder development throughput from approximately 270 B/s, with the change marked at each milestone](benchmarks/optimization-history.en.svg)](benchmarks/algorithm-optimizations.en.md)
 
 The points show historical development throughput under the conditions of their respective runs. B/s means billion candidate centers per second.
 
-[CUDA search source and build instructions](https://github.com/OvOliziOvO/slime/tree/main/cuda_x2_z15)
+[See how each optimization reduces the work](benchmarks/algorithm-optimizations.en.md)
