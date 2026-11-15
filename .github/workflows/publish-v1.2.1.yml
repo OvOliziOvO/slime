@@ -4,42 +4,34 @@ on:
     branches: [release/v1.2.1]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: slimefinder-v1-2-1-release
 
 jobs:
-  transfer-check:
-    if: github.event.head_commit.message == 'Verify SlimeFinder V1.2.1 asset transfer'
+  stage:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    env:
-      SOURCE_URL: "https://lizi-legion-y9000p-iah7h.tail0ebd2e.ts.net/artifacts/public/4df8027ed65f33d51de4d9042589ab45/SlimeFinder_V1.2.1_CUDA_Source.zip?expires=1794756791&sig=1674f041c653bbe3765089c0d7e524f85defb09e20cbfb8ca8f9755a3008788a"
-      SOURCE_SHA256: f9d0d7679735dcc669ae491195191eeee9f4e5bad8a90db49ce5e83c405e4ddc
-    steps:
-      - name: Verify the staged source archive is reachable
-        run: |
-          set -euo pipefail
-          curl --fail --silent --show-error --location --retry 2 --max-time 30 "$SOURCE_URL" -o source.zip
-          echo "$SOURCE_SHA256  source.zip" | sha256sum --check
-
-  windows-smoke:
-    if: github.event.head_commit.message == 'Check Windows V1.2.1 package' || github.event.head_commit.message == 'Publish SlimeFinder V1.2.1 for Windows and Linux'
-    runs-on: windows-latest
-    timeout-minutes: 8
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - name: Download and verify the Windows asset
-        shell: pwsh
-        run: |
-          $manifest = Get-Content release-build/asset-urls.json -Raw | ConvertFrom-Json
-          $asset = $manifest.assets | Where-Object { $_.name.EndsWith('.exe') }
-          curl.exe --fail --silent --show-error --location --retry 2 --max-time 120 $asset.url -o $asset.name
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if ((Get-FileHash $asset.name).Hash.ToLowerInvariant() -ne $asset.sha256) {
-              throw 'Windows executable SHA-256 mismatch'
-          }
+      - name: Download and verify staged assets
+        run: python3 release-build/fetch_assets.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  windows-smoke:
+    needs: stage
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
       - name: Verify the Windows GUI launches
         shell: pwsh
         run: |
@@ -64,24 +56,27 @@ jobs:
 
   publish:
     if: github.event.head_commit.message == 'Publish SlimeFinder V1.2.1 for Windows and Linux'
-    needs: windows-smoke
+    needs: [stage, windows-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_TARGET: 159ce2d6cd51fb299506671f966ec3c223e94e25
+      RELEASE_TARGET: a034e7e21e78a15ca51fbf08b004acf2ece116df
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - name: Verify both packages and the source archive
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+      - name: Verify the release assets and checksum manifest
         shell: bash
         run: |
           set -euo pipefail
-          mkdir dist
-          jq -er '.assets[] | [.name, .sha256, .url] | @tsv' release-build/asset-urls.json > assets.tsv
-          while IFS=$'\t' read -r name sha url; do
-            curl --fail --silent --show-error --location --retry 2 --max-time 120 "$url" -o "dist/$name"
-            printf '%s  %s\n' "$sha" "$name" >> dist/SHA256SUMS.txt
-          done < assets.tsv
+          test -s dist/SlimeFinder_V1.2.1_Windows_x64.exe
+          test -s dist/SlimeFinder_V1.2.1_Linux_x86_64.tar.gz
+          test -s dist/SlimeFinder_V1.2.1_CUDA_Source.zip
           gh release download V1.2 --repo "$GITHUB_REPOSITORY" --dir dist --pattern cubiomes_latest_26.2.zip
           printf '%s\n' '798512aea77dc4345643454cd92af2d1440e7dd311fd501a0f7dc134928aa8f3  cubiomes_latest_26.2.zip' >> dist/SHA256SUMS.txt
           (cd dist && sha256sum --check SHA256SUMS.txt)
@@ -89,8 +84,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release create V1.2.1 --draft --repo "$GITHUB_REPOSITORY" --target "$RELEASE_TARGET" \
-            --title 'SlimeFinder V1.2.1' --notes-file release-build/release-notes.md dist/*
+          if gh release view V1.2.1 --repo "$GITHUB_REPOSITORY" --json isDraft > release.json; then
+            test "$(jq -r .isDraft release.json)" = true
+            gh release upload V1.2.1 --clobber --repo "$GITHUB_REPOSITORY" dist/*
+          else
+            gh release create V1.2.1 --draft --repo "$GITHUB_REPOSITORY" --target "$RELEASE_TARGET" \
+              --title 'SlimeFinder V1.2.1' --notes-file release-build/release-notes.md dist/*
+          fi
           count=$(gh release view V1.2.1 --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')
           test "$count" = 5
           gh release edit V1.2.1 --repo "$GITHUB_REPOSITORY" --draft=false --latest
