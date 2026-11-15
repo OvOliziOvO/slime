@@ -8,6 +8,8 @@ import os
 import subprocess
 import zlib
 
+from refresh_windows import refresh_windows
+
 
 DIST = Path("dist")
 STAGE = Path("release-build")
@@ -55,7 +57,11 @@ def verify(path, expected=None):
 def main():
     DIST.mkdir()
     assemble_windows()
-    sums = [verify(DIST / WINDOWS, WINDOWS_SHA256)]
+    original = DIST / WINDOWS
+    updated = original.with_suffix(".updated.exe")
+    refresh_windows(original, updated)
+    updated.replace(original)
+    sums = [verify(original)]
     linux = STAGE / "linux"
     if linux.is_dir():
         with (DIST / LINUX).open("wb") as target:

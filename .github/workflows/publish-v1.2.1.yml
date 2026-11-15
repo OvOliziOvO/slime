@@ -15,6 +15,11 @@ jobs:
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install archive build dependency
+        run: python -m pip install PyInstaller==6.20.0
       - name: Assemble and verify staged assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -86,7 +91,7 @@ jobs:
           compression-level: 0
 
   publish:
-    if: github.event.head_commit.message == 'Publish SlimeFinder V1.2.1 for Windows and Linux'
+    if: github.event.head_commit.message == 'Refresh SlimeFinder V1.2.1 release assets'
     needs: [stage, windows-smoke, linux-build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -94,7 +99,6 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_TARGET: 159ce2d6cd51fb299506671f966ec3c223e94e25
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: actions/download-artifact@v4
@@ -117,17 +121,5 @@ jobs:
           gh release download V1.2 --repo "$GITHUB_REPOSITORY" --dir dist --pattern cubiomes_latest_26.2.zip
           printf '%s\n' '798512aea77dc4345643454cd92af2d1440e7dd311fd501a0f7dc134928aa8f3  cubiomes_latest_26.2.zip' >> dist/SHA256SUMS.txt
           (cd dist && sha256sum --check SHA256SUMS.txt)
-      - name: Publish Windows, Linux, and CUDA source together
-        shell: bash
-        run: |
-          set -euo pipefail
-          if gh release view V1.2.1 --repo "$GITHUB_REPOSITORY" --json isDraft > release.json; then
-            test "$(jq -r .isDraft release.json)" = true
-            gh release upload V1.2.1 --clobber --repo "$GITHUB_REPOSITORY" dist/*
-          else
-            gh release create V1.2.1 --draft --repo "$GITHUB_REPOSITORY" --target "$RELEASE_TARGET" \
-              --title 'SlimeFinder V1.2.1' --notes-file release-build/release-notes.md dist/*
-          fi
-          count=$(gh release view V1.2.1 --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')
-          test "$count" = 5
-          gh release edit V1.2.1 --repo "$GITHUB_REPOSITORY" --draft=false --latest
+      - name: Refresh files on the existing V1.2.1 release
+        run: python3 release-build/refresh_release.py

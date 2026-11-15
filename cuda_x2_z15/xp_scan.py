@@ -408,12 +408,14 @@ class ExactScan:
             yield offset,h
             offset+=h
 
-    def prepare(self,width,pair):
+    def prepare(self,width,pair,*,checkpoint=None):
         for _,h in self.slab_ranges(width):
             for b in z_layout(h):
                 for p,tiles in zip((2,1),x_layout(width,pair,self.output_width)):
                     if len(tiles)==0 or (p,b) in self.hot:
                         continue
+                    if checkpoint is not None:
+                        checkpoint()
                     resident=self.resident if p==2 else (2 if b>8 else 3)
                     if self.packed_counts and b<=8:
                         resident=3
@@ -440,7 +442,7 @@ class ExactScan:
                         self.d.call("cuOccupancyMaxActiveBlocksPerMultiprocessor",c.byref(occupancy),kernel,INT(self.threads),c.c_size_t(0))
                         print(f"compiled X{p} Z{b} regs={metrics[0]} shared={metrics[1]} local={metrics[2]} blocks/SM={occupancy.value}",flush=True)
 
-    def scan(self,seed,radius,threshold,center_x,center_z,pair,initial_cap=None,*,checkpoint=None):
+    def scan(self,seed,radius,threshold,center_x,center_z,pair,initial_cap=None,*,checkpoint=None,progress=None):
         d=self.d
         fresh=len(d.buffers)
         t0=perf_counter()
@@ -450,31 +452,38 @@ class ExactScan:
         assert max(abs(xlow),abs(xhigh),abs(zlow),abs(zhigh))<=100_000_000
         xsize=n+INPUT+32
         zsize=ceil(n,PERIOD)*PERIOD+32
-        x=d.empty(xsize*8); z=d.empty(zsize*8)
-        packed=d.empty((PERIOD+20)*packed_row_bytes(self.z_bands))
         cap=initial_cap if initial_cap is not None else (1<<23 if threshold>=59 else 1<<25)
-        q=d.empty(cap*16)
-        qcount=d.empty(8)
-        out=d.empty(CAPACITY*16)
-        out_count=d.empty(8)
         stages=[]
+        completed_centers = 0
+        bounded_batches = checkpoint is not None or progress is not None
         try:
+            x=d.empty(xsize*8); z=d.empty(zsize*8)
+            packed=d.empty((PERIOD+20)*packed_row_bytes(self.z_bands))
+            q=d.empty(cap*16)
+            qcount=d.empty(8)
+            out=d.empty(CAPACITY*16)
+            out_count=d.empty(8)
             d.start(self.k["terms_x"],ceil(xsize,256),256,x,INT(xlow-8),UINT(xsize))
             d.start(self.k["terms_z"],ceil(zsize,256),256,z,INT(zlow-8),UINT(zsize),U64(seed))
             d.zero(out_count)
-            xsets=[(p,len(tiles),d.alloc(tiles)) for p,tiles in zip((2,1),x_layout(n,pair,self.output_width)) if len(tiles)]
+            xsets = [(p, tiles, d.alloc(tiles)) for p, tiles in
+                     zip((2, 1), x_layout(n, pair, self.output_width)) if len(tiles)]
             for offset,h in self.slab_ranges(n):
                 bands=ceil(h,PERIOD)
                 d.start(self.k["pack_z"],ceil(PERIOD+20,256),256,z,packed,UINT(offset),UINT(PERIOD+20),UINT(bands))
-                zsets=[(b,len(a),d.alloc(a)) for b,a in z_layout(h).items()]
+                zsets = [(b, len(tiles), b * int(tiles[:, 1].sum()), d.alloc(tiles))
+                         for b, tiles in z_layout(h).items()]
                 tk=perf_counter()
+                reported_centers = 0
                 while True:
                     d.zero(qcount)
-                    for p,nx,xt in xsets:
-                        for b,nz,zt in zsets:
+                    attempt_centers = 0
+                    for p, tiles, xt in xsets:
+                        nx = len(tiles)
+                        for b, nz, height, zt in zsets:
                             # Short launches allow UI pause/cancel checkpoints and keep
                             # display-driver jobs bounded on Windows.
-                            batch_width = nx if checkpoint is None else max(1, 4096 // nz)
+                            batch_width = max(1, 4096 // nz) if bounded_batches else nx
                             for first in range(0, nx, batch_width):
                                 count_x = min(batch_width, nx - first)
                                 tile_x = U64(xt.value + first * 8)
@@ -483,21 +492,33 @@ class ExactScan:
                                 d.start(self.hot[p,b],count_x*nz,self.threads,x,packed,UINT(count_x),
                                         tile_x,zt,q,qcount,UINT(cap),INT(xlow),INT(zlow+offset),
                                         UINT(h),UINT(threshold))
-                                if checkpoint is not None:
+                                if bounded_batches:
                                     d.call("cuCtxSynchronize")
+                                if progress is not None:
+                                    width = p * int(tiles[first:first + count_x, 1].sum())
+                                    attempt_centers += width * height
+                                    # A queue retry covers the same centers again.
+                                    # Its time counts, and its centers count once.
+                                    reported_centers = max(reported_centers, attempt_centers)
+                                    progress(completed_centers + reported_centers, False)
                     count=d.u64(qcount)
                     if count<=cap:
                         break
                     d.release(q)
                     cap=ceil(count,1<<20)*(1<<20)
                     q=d.empty(cap*16)
-                for _,_,zt in zsets:
+                for _, _, _, zt in zsets:
                     d.release(zt)
+                if checkpoint is not None:
+                    checkpoint()
+                completed_centers += n * h
                 td=perf_counter()
                 self.refine(x,z,q,count,out,out_count,xlow,zlow,threshold)
                 stages.append((count,td-tk,perf_counter()-td))
             final_start=perf_counter()
             while True:
+                if checkpoint is not None:
+                    checkpoint()
                 d.zero(qcount)
                 d.start(self.k["rare_groups"],ceil(n+16,256),256,z,*self.rare,q,qcount,UINT(cap),
                         INT(xlow),INT(xhigh),INT(zlow),INT(zhigh))
@@ -516,6 +537,8 @@ class ExactScan:
             a=d.download(out,(hits,4)).view(np.int32)
             result=sorted({tuple(map(int,line[:3])) for line in a})
             elapsed=perf_counter()-t0
+            if progress is not None:
+                progress(completed_centers, True)
             if self.verbose:
                 print("stages",[(n,round(s,5),round(t,5)) for n,s,t in stages],
                       "rare candidate groups",rare,"rare+read",round(perf_counter()-final_start,5),flush=True)
