@@ -1,4 +1,4 @@
-# Slime Finder V1.1
+# Slime Finder
 
 [English](README.md) | **简体中文**
 
@@ -22,7 +22,9 @@ Minecraft Java Edition 高性能史莱姆农场选址工具。
 > 史莱姆搜索核心完整保留 Java `nextInt(10)` rejection 语义，不使用概率近似或抽样换速度。
 
 
-Windows x64 下载：[Slime Finder V1.1](https://github.com/OvOliziOvO/slime/releases/tag/V1.1)。
+Windows x64 预览版含 SM 8.6 快速路径和暂停后取消、重搜修复。[下载 SlimeFinder V1.2 预览版](https://github.com/OvOliziOvO/slime/releases/tag/V1.2-preview)。
+
+Windows x64 通用版。[下载 Slime Finder V1.1](https://github.com/OvOliziOvO/slime/releases/tag/V1.1)。
 
 通用版搜索核心使用 `build_gpu_universal_x64.bat` / CUDA 12.9 编译，包含 GTX 10、RTX 20、RTX 30、RTX 40、RTX 50 对应的 `sm_61 / 75 / 86 / 89 / 120` 机器码，以及兼容 PTX。GPU 群系组件保留原有兼容 PTX；需要可用的 NVIDIA CUDA 驱动。无可用 CUDA 显卡（包括仅有 AMD / Intel 显卡）时，Auto 默认使用 CPU 原生搜索。
 

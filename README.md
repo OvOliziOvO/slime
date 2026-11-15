@@ -1,4 +1,4 @@
-# Slime Finder V1.1
+# Slime Finder
 
 **English** | [简体中文](README.zh-CN.md)
 
@@ -20,7 +20,9 @@ Designed to search for slime-chunk clusters across large areas or even the entir
 
 > The slime-search core preserves the full Java `nextInt(10)` rejection semantics. It does not trade correctness for speed through probabilistic approximation or sampling.
 
-Windows x64 download: [Slime Finder V1.1](https://github.com/OvOliziOvO/slime/releases/tag/V1.1).
+Windows x64 preview with the SM 8.6 fast path and pause/cancel/restart fix. [Download SlimeFinder V1.2 Preview](https://github.com/OvOliziOvO/slime/releases/tag/V1.2-preview).
+
+Universal Windows x64 release. [Download Slime Finder V1.1](https://github.com/OvOliziOvO/slime/releases/tag/V1.1).
 
 The universal search core is built with `build_gpu_universal_x64.bat` / CUDA 12.9 and includes machine code for GTX 10, RTX 20, RTX 30, RTX 40, and RTX 50 (`sm_61 / 75 / 86 / 89 / 120`), plus compatible PTX. The GPU biome component also retains compatible PTX. A working NVIDIA CUDA driver is required. If no usable CUDA GPU is available, including systems with only AMD / Intel graphics, Auto mode defaults to the native CPU search.
 
