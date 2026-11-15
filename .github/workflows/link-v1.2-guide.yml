@@ -1,0 +1,23 @@
+name: Link the V1.2 algorithm guide
+
+on:
+  push:
+    branches: [release/v1.2-guide]
+
+permissions:
+  contents: write
+
+jobs:
+  edit-notes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Update the V1.2 release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit V1.2 --repo "$GITHUB_REPOSITORY" --notes-file release-build/V1.2-release-notes.md
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)" = V1.2
