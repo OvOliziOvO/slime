@@ -26,6 +26,24 @@ The universal search core is built with `build_gpu_universal_x64.bat` / CUDA 12.
 
 CPU biome checks require installing `cubiomes_latest_26.2.zip` separately from the release page and placing `cubiomes.dll` next to the program. CPU slime search itself does not depend on this component.
 
+## From 270 B/s to 10 seconds
+
+![Annotated SlimeFinder throughput curve from approximately 270 to 1409.15 B/s](benchmarks/optimization-history.en.svg)
+
+The chart follows development milestones on an RTX 3060 Laptop GPU. **B/s** is billion candidate centers per second. The earliest throughput is a historical approximate value. Later standard full-world runs use seed `123456789`, center `(0, 0)`, radius `1,875,000` chunks, threshold `60` and **14,062,507,500,001** candidate centers. The milestone points come from their respective measurement runs. The table gives the matched comparisons.
+
+| Change | Full-world comparison | Throughput gain |
+|---|---:|---:|
+| Six paired bands, with complementary parity 131,072 chunks apart | 24.53 → 22.89 s Auto | 1.64 s saved |
+| Four bitmaps for six bands, including the fast tail | 22.439 → 17.978 s GPU | +24.81% |
+| Share low RNG work across two X phases and eight Z bands | 17.44 → 13.98 s GPU | +24.73% |
+| Twelve Z bands, paired rolling counters and fused Tensor Core counts | 14.06 → 13.31 s GPU | +5.62% |
+| Fifteen Z bands with interleaved rows and vector bitmap loads | 10.387 → 10.042 s GPU median | +3.44% |
+
+The saved Linux CUDA snapshot ran **9.979 s** once (**1409.15 B/s**, **1.409 T/s**). Its three-run GPU median was **10.042 s**. Auto including ranking and image generation took **10.257 s**. The nine hits, ranking and PNG hash matched the reference. The Windows V1.1 figures below use their separate, smaller benchmark.
+
+The [Python PTX generator](cuda_x2_z15/) includes the high-threshold search, bitmaps, Tensor Core counts, exact Java redraw correction and build instructions. The generated PTX can be exported for inspection. The universal CUDA C++ implementation is in `SlimeCoreGPU.cu`.
+
 ## Performance
 
 Test device: **RTX 3060 Laptop GPU, 6 GB, Windows x64**. The numbers below are actual measurements from the V1.1 universal release DLL.
@@ -143,7 +161,7 @@ FRONTEND_SMOKE_OK
 
 ## Algorithm source
 
-The public repository keeps only the algorithm core, build scripts, and necessary licenses / data tables. It does not include the GUI frontend source, test logs, benchmark records, or local experiment files.
+The repository includes the algorithm cores, a Python PTX generator for the SM 8.6 experimental search, build scripts, and the accompanying benchmark summary.
 
 Main source files:
 
