@@ -15,7 +15,9 @@ jobs:
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - name: Download and verify staged assets
+      - name: Assemble and verify staged assets
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: python3 release-build/fetch_assets.py
       - uses: actions/upload-artifact@v4
         with:
@@ -63,7 +65,7 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_TARGET: a034e7e21e78a15ca51fbf08b004acf2ece116df
+      RELEASE_TARGET: 159ce2d6cd51fb299506671f966ec3c223e94e25
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: actions/download-artifact@v4
