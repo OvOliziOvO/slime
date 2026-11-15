@@ -25,7 +25,7 @@ jobs:
           echo "$SOURCE_SHA256  source.zip" | sha256sum --check
 
   windows-smoke:
-    if: github.event.head_commit.message == 'Publish SlimeFinder V1.2.1 for Windows and Linux'
+    if: github.event.head_commit.message == 'Check Windows V1.2.1 package' || github.event.head_commit.message == 'Publish SlimeFinder V1.2.1 for Windows and Linux'
     runs-on: windows-latest
     timeout-minutes: 8
     steps:
@@ -63,6 +63,7 @@ jobs:
           }
 
   publish:
+    if: github.event.head_commit.message == 'Publish SlimeFinder V1.2.1 for Windows and Linux'
     needs: windows-smoke
     runs-on: ubuntu-latest
     timeout-minutes: 10
