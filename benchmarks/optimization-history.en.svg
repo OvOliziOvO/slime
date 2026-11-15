@@ -1,91 +1,96 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1316" height="563" viewBox="0 0 1316 563" role="img" aria-labelledby="title desc">
-<title id="title">SlimeFinder optimization history · 270 → 1409.15 B/s</title>
-<desc id="desc">RTX 3060 Laptop · threshold 60 · billion candidate centers per second · Development milestones. Early values are historical. Later full-world runs use seed 123456789 and radius 1,875,000.</desc>
-<defs><linearGradient id="area" x1="0" y1="0" x2="0" y2="1" gradientUnits="objectBoundingBox">
-<stop offset="0%" stop-color="#2dd4bf" stop-opacity=".23"/><stop offset="100%" stop-color="#2dd4bf" stop-opacity=".01"/>
-</linearGradient></defs>
-<rect width="1316" height="563" rx="22" fill="#0b1828"/>
-<g font-family="Noto Sans CJK SC, Microsoft YaHei, Segoe UI, system-ui, sans-serif">
-<text x="62" y="58" font-size="31" font-weight="700" fill="#edf5ff">SlimeFinder optimization history</text>
-<text x="63" y="88" font-size="15" fill="#afc2d8">RTX 3060 Laptop · threshold 60 · billion candidate centers per second</text>
-<text x="1254" y="61" text-anchor="end" font-size="24" font-weight="700" fill="#67e8d3">270 → 1409.15 B/s</text>
-<path d="M73 430.0H1252" stroke="#263b50"/>
-<text x="63" y="434.0" text-anchor="end" font-size="12" fill="#93adc7">0</text>
-<path d="M73 380.0H1252" stroke="#263b50"/>
-<text x="63" y="384.0" text-anchor="end" font-size="12" fill="#93adc7">250</text>
-<path d="M73 330.0H1252" stroke="#263b50"/>
-<text x="63" y="334.0" text-anchor="end" font-size="12" fill="#93adc7">500</text>
-<path d="M73 280.0H1252" stroke="#263b50"/>
-<text x="63" y="284.0" text-anchor="end" font-size="12" fill="#93adc7">750</text>
-<path d="M73 230.0H1252" stroke="#427469" stroke-dasharray="6 5"/>
-<text x="63" y="234.0" text-anchor="end" font-size="12" fill="#93adc7">1000</text>
-<path d="M73 180.0H1252" stroke="#263b50"/>
-<text x="63" y="184.0" text-anchor="end" font-size="12" fill="#93adc7">1250</text>
-<path d="M73 130.0H1252" stroke="#263b50"/>
-<text x="63" y="134.0" text-anchor="end" font-size="12" fill="#93adc7">1500</text>
-<text x="1252" y="223" text-anchor="end" font-size="12" fill="#83d6c6">1 T/s</text>
-<polygon points="115,430 115,376.00 215,349.25 315,334.75 415,316.53 515,305.57 615,273.56 715,228.79 815,218.70 915,191.90 1015,168.90 1115,158.33 1215,148.17 1215,430" fill="url(#area)"/>
-<polyline points="115,376.00 215,349.25 315,334.75 415,316.53 515,305.57 615,273.56 715,228.79 815,218.70 915,191.90 1015,168.90 1115,158.33 1215,148.17" fill="none" stroke="#58dec7" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>
-<path d="M115 385.00V441" stroke="#36516b" stroke-dasharray="3 6" opacity=".75"/>
-<circle cx="115" cy="376.00" r="6" fill="#0b1828" stroke="#93f4e3" stroke-width="2"/>
-<text x="115" y="362.00" fill="#dbfff8" font-size="14" font-weight="700" text-anchor="middle">≈270</text>
-<text x="115" y="470" text-anchor="middle" fill="#edf5ff" font-size="12.5" font-weight="600">Rolling bound</text>
-<text x="115" y="489" text-anchor="middle" fill="#afc2d8" font-size="12">Exact 221 cells</text>
-<path d="M215 358.25V441" stroke="#36516b" stroke-dasharray="3 6" opacity=".75"/>
-<circle cx="215" cy="349.25" r="6" fill="#0b1828" stroke="#93f4e3" stroke-width="2"/>
-<text x="215" y="335.25" fill="#dbfff8" font-size="14" font-weight="700" text-anchor="middle">403.77</text>
-<text x="215" y="470" text-anchor="middle" fill="#edf5ff" font-size="12.5" font-weight="600">Six Z bands</text>
-<text x="215" y="489" text-anchor="middle" fill="#afc2d8" font-size="12">Share RNG bits</text>
-<path d="M315 343.75V441" stroke="#36516b" stroke-dasharray="3 6" opacity=".75"/>
-<circle cx="315" cy="334.75" r="6" fill="#58dec7" stroke="#93f4e3" stroke-width="2"/>
-<text x="315" y="320.75" fill="#dbfff8" font-size="14" font-weight="700" text-anchor="middle">476.26</text>
-<text x="315" y="470" text-anchor="middle" fill="#edf5ff" font-size="12.5" font-weight="600">Tensor Core</text>
-<text x="315" y="489" text-anchor="middle" fill="#afc2d8" font-size="12">Bitmap counts</text>
-<path d="M415 325.53V441" stroke="#36516b" stroke-dasharray="3 6" opacity=".75"/>
-<circle cx="415" cy="316.53" r="6" fill="#58dec7" stroke="#93f4e3" stroke-width="2"/>
-<text x="415" y="302.53" fill="#dbfff8" font-size="14" font-weight="700" text-anchor="middle">≈567</text>
-<text x="415" y="470" text-anchor="middle" fill="#edf5ff" font-size="12.5" font-weight="600">Rare Java redraw</text>
-<text x="415" y="489" text-anchor="middle" fill="#afc2d8" font-size="12">Sparse lookup</text>
-<path d="M515 314.57V441" stroke="#36516b" stroke-dasharray="3 6" opacity=".75"/>
-<circle cx="515" cy="305.57" r="6" fill="#58dec7" stroke="#93f4e3" stroke-width="2"/>
-<text x="515" y="291.57" fill="#dbfff8" font-size="14" font-weight="700" text-anchor="middle">622.17</text>
-<text x="515" y="470" text-anchor="middle" fill="#edf5ff" font-size="12.5" font-weight="600">Six bands</text>
-<text x="515" y="489" text-anchor="middle" fill="#afc2d8" font-size="12">Three parity pairs</text>
-<path d="M615 282.56V441" stroke="#36516b" stroke-dasharray="3 6" opacity=".75"/>
-<circle cx="615" cy="273.56" r="6" fill="#58dec7" stroke="#93f4e3" stroke-width="2"/>
-<text x="615" y="259.56" fill="#dbfff8" font-size="14" font-weight="700" text-anchor="middle">782.21</text>
-<text x="615" y="470" text-anchor="middle" fill="#edf5ff" font-size="12.5" font-weight="600">Six maps → four</text>
-<text x="615" y="489" text-anchor="middle" fill="#afc2d8" font-size="12">Faster tail</text>
-<path d="M715 237.79V441" stroke="#36516b" stroke-dasharray="3 6" opacity=".75"/>
-<circle cx="715" cy="228.79" r="6" fill="#58dec7" stroke="#93f4e3" stroke-width="2"/>
-<text x="715" y="214.79" fill="#dbfff8" font-size="14" font-weight="700" text-anchor="middle">1006.03</text>
-<text x="715" y="470" text-anchor="middle" fill="#edf5ff" font-size="12.5" font-weight="600">Two X phases</text>
-<text x="715" y="489" text-anchor="middle" fill="#afc2d8" font-size="12">Eight Z bands</text>
-<path d="M815 227.70V441" stroke="#36516b" stroke-dasharray="3 6" opacity=".75"/>
-<circle cx="815" cy="218.70" r="6" fill="#58dec7" stroke="#93f4e3" stroke-width="2"/>
-<text x="815" y="204.70" fill="#dbfff8" font-size="14" font-weight="700" text-anchor="middle">1056.51</text>
-<text x="815" y="470" text-anchor="middle" fill="#edf5ff" font-size="12.5" font-weight="600">Twelve Z bands</text>
-<text x="815" y="489" text-anchor="middle" fill="#afc2d8" font-size="12">Packed counts</text>
-<path d="M915 200.90V441" stroke="#36516b" stroke-dasharray="3 6" opacity=".75"/>
-<circle cx="915" cy="191.90" r="6" fill="#58dec7" stroke="#93f4e3" stroke-width="2"/>
-<text x="915" y="177.90" fill="#dbfff8" font-size="14" font-weight="700" text-anchor="middle">1190.48</text>
-<text x="915" y="470" text-anchor="middle" fill="#edf5ff" font-size="12.5" font-weight="600">Parity hoisting</text>
-<text x="915" y="489" text-anchor="middle" fill="#afc2d8" font-size="12">Split cold work</text>
-<path d="M1015 177.90V441" stroke="#36516b" stroke-dasharray="3 6" opacity=".75"/>
-<circle cx="1015" cy="168.90" r="6" fill="#58dec7" stroke="#93f4e3" stroke-width="2"/>
-<text x="1015" y="154.90" fill="#dbfff8" font-size="14" font-weight="700" text-anchor="middle">1305.48</text>
-<text x="1015" y="470" text-anchor="middle" fill="#edf5ff" font-size="12.5" font-weight="600">Four-band gate</text>
-<text x="1015" y="489" text-anchor="middle" fill="#afc2d8" font-size="12">Tensor corner cut</text>
-<path d="M1115 167.33V441" stroke="#36516b" stroke-dasharray="3 6" opacity=".75"/>
-<circle cx="1115" cy="158.33" r="6" fill="#58dec7" stroke="#93f4e3" stroke-width="2"/>
-<text x="1115" y="144.33" fill="#dbfff8" font-size="14" font-weight="700" text-anchor="middle">1358.33</text>
-<text x="1115" y="470" text-anchor="middle" fill="#edf5ff" font-size="12.5" font-weight="600">Fifteen Z bands</text>
-<text x="1115" y="489" text-anchor="middle" fill="#afc2d8" font-size="12">Tail split</text>
-<path d="M1215 157.17V441" stroke="#36516b" stroke-dasharray="3 6" opacity=".75"/>
-<circle cx="1215" cy="148.17" r="6" fill="#58dec7" stroke="#93f4e3" stroke-width="2"/>
-<text x="1215" y="134.17" fill="#dbfff8" font-size="14" font-weight="700" text-anchor="middle">1409.15</text>
-<text x="1215" y="470" text-anchor="middle" fill="#edf5ff" font-size="12.5" font-weight="600">Interleave rows</text>
-<text x="1215" y="489" text-anchor="middle" fill="#afc2d8" font-size="12">Vector bitmap loads</text>
-<path d="M62 511H1254" stroke="#263b50"/>
-<text x="62" y="537" font-size="13" fill="#afc2d8">Development milestones. Early values are historical. Later full-world runs use seed 123456789 and radius 1,875,000.</text>
-</g></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="452" viewBox="0 0 1320 452" role="img" aria-labelledby="title desc">
+<title id="title">SlimeFinder optimization history</title>
+<desc id="desc">Historical throughput · billion candidate centers per second</desc>
+<g font-family="Noto Sans CJK SC, Microsoft YaHei, Segoe UI, sans-serif" fill="#111" stroke="#fff" stroke-width="2.1" paint-order="stroke fill" stroke-linejoin="round">
+<text x="56" y="48" font-size="29" font-weight="700">SlimeFinder optimization history</text>
+<text x="57" y="73" font-size="14">Historical throughput · billion candidate centers per second</text>
+<path d="M68 357.00H1264" stroke="#a5a5a5" stroke-width="1"/>
+<text x="57" y="361.00" text-anchor="end" font-size="12">0</text>
+<path d="M68 314.17H1264" stroke="#d8d8d8" stroke-width="1"/>
+<text x="57" y="318.17" text-anchor="end" font-size="12">250</text>
+<path d="M68 271.33H1264" stroke="#d8d8d8" stroke-width="1"/>
+<text x="57" y="275.33" text-anchor="end" font-size="12">500</text>
+<path d="M68 228.50H1264" stroke="#d8d8d8" stroke-width="1"/>
+<text x="57" y="232.50" text-anchor="end" font-size="12">750</text>
+<path d="M68 185.67H1264" stroke="#a5a5a5" stroke-width="1" stroke-dasharray="4 5"/>
+<text x="57" y="189.67" text-anchor="end" font-size="12">1,000</text>
+<path d="M68 142.83H1264" stroke="#d8d8d8" stroke-width="1"/>
+<text x="57" y="146.83" text-anchor="end" font-size="12">1,250</text>
+<path d="M68 100.00H1264" stroke="#d8d8d8" stroke-width="1"/>
+<text x="57" y="104.00" text-anchor="end" font-size="12">1,500</text>
+<path d="M111 317.74V368" stroke="#b8b8b8" stroke-width="1" stroke-dasharray="2 5"/>
+<path d="M211 294.82V368" stroke="#b8b8b8" stroke-width="1" stroke-dasharray="2 5"/>
+<path d="M311 282.40V368" stroke="#b8b8b8" stroke-width="1" stroke-dasharray="2 5"/>
+<path d="M411 266.79V368" stroke="#b8b8b8" stroke-width="1" stroke-dasharray="2 5"/>
+<path d="M511 257.40V368" stroke="#b8b8b8" stroke-width="1" stroke-dasharray="2 5"/>
+<path d="M611 229.98V368" stroke="#b8b8b8" stroke-width="1" stroke-dasharray="2 5"/>
+<path d="M711 191.63V368" stroke="#b8b8b8" stroke-width="1" stroke-dasharray="2 5"/>
+<path d="M811 182.98V368" stroke="#b8b8b8" stroke-width="1" stroke-dasharray="2 5"/>
+<path d="M911 160.03V368" stroke="#b8b8b8" stroke-width="1" stroke-dasharray="2 5"/>
+<path d="M1011 140.33V368" stroke="#b8b8b8" stroke-width="1" stroke-dasharray="2 5"/>
+<path d="M1111 131.27V368" stroke="#b8b8b8" stroke-width="1" stroke-dasharray="2 5"/>
+<path d="M1211 122.57V368" stroke="#b8b8b8" stroke-width="1" stroke-dasharray="2 5"/>
+<polyline points="111,310.74 211,287.82 311,275.40 411,259.79 511,250.40 611,222.98 711,184.63 811,175.98 911,153.03 1011,133.33 1111,124.27 1211,115.57" fill="none" stroke="#fff" stroke-width="6" stroke-linejoin="round" stroke-linecap="round"/>
+<polyline points="111,310.74 211,287.82 311,275.40 411,259.79 511,250.40 611,222.98 711,184.63 811,175.98 911,153.03 1011,133.33 1111,124.27 1211,115.57" fill="none" stroke="#000" stroke-width="2.8" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="111" cy="310.74" r="5.3" fill="#fff" stroke="#fff" stroke-width="3.6"/>
+<circle cx="111" cy="310.74" r="4.6" fill="#fff" stroke="#000" stroke-width="1.7"/>
+<text x="111" y="295.74" text-anchor="middle" font-size="16" font-weight="700">≈270</text>
+<text x="111" y="394" text-anchor="middle" font-size="12.8" font-weight="700">Rolling bound</text>
+<text x="111" y="416" text-anchor="middle" font-size="12.3">Exact 221 cells</text>
+<circle cx="211" cy="287.82" r="5.3" fill="#fff" stroke="#fff" stroke-width="3.6"/>
+<circle cx="211" cy="287.82" r="4.6" fill="#fff" stroke="#000" stroke-width="1.7"/>
+<text x="211" y="272.82" text-anchor="middle" font-size="16" font-weight="700">403.77</text>
+<text x="211" y="394" text-anchor="middle" font-size="12.8" font-weight="700">Six Z bands</text>
+<text x="211" y="416" text-anchor="middle" font-size="12.3">Share RNG bits</text>
+<circle cx="311" cy="275.40" r="5.3" fill="#fff" stroke="#fff" stroke-width="3.6"/>
+<circle cx="311" cy="275.40" r="4.6" fill="#fff" stroke="#000" stroke-width="1.7"/>
+<text x="311" y="260.40" text-anchor="middle" font-size="16" font-weight="700">476.26</text>
+<text x="311" y="394" text-anchor="middle" font-size="12.8" font-weight="700">Tensor Core</text>
+<text x="311" y="416" text-anchor="middle" font-size="12.3">Bitmap counts</text>
+<circle cx="411" cy="259.79" r="5.3" fill="#fff" stroke="#fff" stroke-width="3.6"/>
+<circle cx="411" cy="259.79" r="4.6" fill="#fff" stroke="#000" stroke-width="1.7"/>
+<text x="411" y="244.79" text-anchor="middle" font-size="16" font-weight="700">≈567</text>
+<text x="411" y="394" text-anchor="middle" font-size="12.8" font-weight="700">Rare Java redraw</text>
+<text x="411" y="416" text-anchor="middle" font-size="12.3">Sparse lookup</text>
+<circle cx="511" cy="250.40" r="5.3" fill="#fff" stroke="#fff" stroke-width="3.6"/>
+<circle cx="511" cy="250.40" r="4.6" fill="#fff" stroke="#000" stroke-width="1.7"/>
+<text x="511" y="235.40" text-anchor="middle" font-size="16" font-weight="700">622.17</text>
+<text x="511" y="394" text-anchor="middle" font-size="12.8" font-weight="700">Three band pairs</text>
+<text x="511" y="416" text-anchor="middle" font-size="12.3">Exploit parity</text>
+<circle cx="611" cy="222.98" r="5.3" fill="#fff" stroke="#fff" stroke-width="3.6"/>
+<circle cx="611" cy="222.98" r="4.6" fill="#fff" stroke="#000" stroke-width="1.7"/>
+<text x="611" y="207.98" text-anchor="middle" font-size="16" font-weight="700">782.21</text>
+<text x="611" y="394" text-anchor="middle" font-size="12.8" font-weight="700">6 bitmaps → 4</text>
+<text x="611" y="416" text-anchor="middle" font-size="12.3">Faster tail</text>
+<circle cx="711" cy="184.63" r="5.3" fill="#fff" stroke="#fff" stroke-width="3.6"/>
+<circle cx="711" cy="184.63" r="4.6" fill="#fff" stroke="#000" stroke-width="1.7"/>
+<text x="711" y="169.63" text-anchor="middle" font-size="16" font-weight="700">1006.03</text>
+<text x="711" y="394" text-anchor="middle" font-size="12.8" font-weight="700">Two X phases</text>
+<text x="711" y="416" text-anchor="middle" font-size="12.3">Eight Z bands</text>
+<circle cx="811" cy="175.98" r="5.3" fill="#fff" stroke="#fff" stroke-width="3.6"/>
+<circle cx="811" cy="175.98" r="4.6" fill="#fff" stroke="#000" stroke-width="1.7"/>
+<text x="811" y="160.98" text-anchor="middle" font-size="16" font-weight="700">1056.51</text>
+<text x="811" y="394" text-anchor="middle" font-size="12.8" font-weight="700">Twelve Z bands</text>
+<text x="811" y="416" text-anchor="middle" font-size="12.3">Packed counts</text>
+<circle cx="911" cy="153.03" r="5.3" fill="#fff" stroke="#fff" stroke-width="3.6"/>
+<circle cx="911" cy="153.03" r="4.6" fill="#fff" stroke="#000" stroke-width="1.7"/>
+<text x="911" y="138.03" text-anchor="middle" font-size="16" font-weight="700">1190.48</text>
+<text x="911" y="394" text-anchor="middle" font-size="12.8" font-weight="700">Reorder parity</text>
+<text x="911" y="416" text-anchor="middle" font-size="12.3">Split cold work</text>
+<circle cx="1011" cy="133.33" r="5.3" fill="#fff" stroke="#fff" stroke-width="3.6"/>
+<circle cx="1011" cy="133.33" r="4.6" fill="#fff" stroke="#000" stroke-width="1.7"/>
+<text x="1011" y="118.33" text-anchor="middle" font-size="16" font-weight="700">1305.48</text>
+<text x="1011" y="394" text-anchor="middle" font-size="12.8" font-weight="700">Four-band count</text>
+<text x="1011" y="416" text-anchor="middle" font-size="12.3">Tensor corner cut</text>
+<circle cx="1111" cy="124.27" r="5.3" fill="#fff" stroke="#fff" stroke-width="3.6"/>
+<circle cx="1111" cy="124.27" r="4.6" fill="#fff" stroke="#000" stroke-width="1.7"/>
+<text x="1111" y="109.27" text-anchor="middle" font-size="16" font-weight="700">1358.33</text>
+<text x="1111" y="394" text-anchor="middle" font-size="12.8" font-weight="700">Fifteen Z bands</text>
+<text x="1111" y="416" text-anchor="middle" font-size="12.3">Tail split</text>
+<circle cx="1211" cy="115.57" r="5.3" fill="#fff" stroke="#fff" stroke-width="3.6"/>
+<circle cx="1211" cy="115.57" r="4.6" fill="#fff" stroke="#000" stroke-width="1.7"/>
+<text x="1211" y="100.57" text-anchor="middle" font-size="16" font-weight="700">1409.15</text>
+<text x="1211" y="394" text-anchor="middle" font-size="12.8" font-weight="700">Interleave rows</text>
+<text x="1211" y="416" text-anchor="middle" font-size="12.3">Vector loads</text>
+</g>
+</svg>
