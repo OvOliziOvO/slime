@@ -2,9 +2,8 @@
 from time import sleep
 
 from .xp_scan import ExactScan, ScanDriver
-from .x_phase import UnsupportedDevice
 
-ALGORITHM_NAME = "CUDA 双 X Phase · 15 Z Band · Tensor Core"
+ALGORITHM_NAME = "CUDA 双 X Phase · 15 Z Band"
 
 
 def is_eligible(radius, minimum, maximum, inner_radius, precise, x, z):
@@ -26,7 +25,7 @@ def scan_candidates(seed, radius, minimum, x, z, controls):
             raise InterruptedError("Search cancelled")
 
     checkpoint()
-    driver = ScanDriver(required_capability=(8, 6))
+    driver = ScanDriver()
     try:
         scan = ExactScan(6, 4, driver=driver, verbose=False)
         scan.prepare(2 * radius + 1, True)

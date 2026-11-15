@@ -7,7 +7,23 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 
-def compile_cubin(ptx, ptxas=None):
+from .scalar_mma import lower_binary_mma
+
+RELEASE_ARCHS = (61, 75, 86, 89, 120)
+
+
+def target_program(program, arch):
+    if isinstance(program, bytes):
+        program = program.decode()
+    if arch < 80:
+        program = lower_binary_mma(program)
+    version = "8.7" if arch >= 100 else "8.0"
+    return program.replace(".version 8.0", f".version {version}", 1).replace(
+        ".target sm_86", f".target sm_{arch}", 1
+    ).encode()
+
+
+def compile_cubin(ptx, arch, ptxas=None):
     if ptxas is not None or sys.platform == "win32":
         assembler = ptxas or shutil.which("ptxas")
         if assembler is None:
@@ -17,7 +33,7 @@ def compile_cubin(ptx, ptxas=None):
             target = source.with_suffix(".cubin")
             source.write_bytes(ptx)
             subprocess.run(
-                [str(assembler), "-arch=sm_86", "-O3", "-o", str(target), str(source)],
+                [str(assembler), f"-arch=sm_{arch}", "-O3", "-o", str(target), str(source)],
                 check=True,
             )
             return target.read_bytes()
@@ -28,7 +44,7 @@ def compile_cubin(ptx, ptxas=None):
     if compiler.nvPTXCompilerCreate(c.byref(handle), len(ptx), ptx):
         raise RuntimeError("Could not create the NVIDIA PTX compiler")
     try:
-        flags = (c.c_char_p * 3)(b"--gpu-name=sm_86", b"--opt-level=3", b"--verbose")
+        flags = (c.c_char_p * 3)(f"--gpu-name=sm_{arch}".encode(), b"--opt-level=3", b"--verbose")
         if compiler.nvPTXCompilerCompile(handle, len(flags), flags):
             log_size = c.c_size_t()
             compiler.nvPTXCompilerGetErrorLogSize(handle, c.byref(log_size))
@@ -46,13 +62,16 @@ def compile_cubin(ptx, ptxas=None):
         compiler.nvPTXCompilerDestroy(c.byref(handle))
 
 
-def cached_cubin(program):
-    name=sha256(program).hexdigest()+".cubin"
-    path=Path(__file__).resolve().with_name("cubin")/name
-    if path.is_file():
-        return path.read_bytes()
-    if sys.platform == "win32":
-        # The CUDA driver can load the PTX directly for a source checkout.
-        # Published Windows executables carry the measured cubin cache.
-        return program + b"\0"
-    return compile_cubin(program)
+def cubin_path(program, arch):
+    name = sha256(program).hexdigest() + ".cubin"
+    return Path(__file__).resolve().with_name("cubin") / f"sm_{arch}" / name
+
+
+def module_image(program, arch):
+    if arch in RELEASE_ARCHS:
+        image = target_program(program, arch)
+        path = cubin_path(image, arch)
+        if path.is_file():
+            return path.read_bytes()
+    # Load virtual PTX for source checkouts and compatible unlisted devices.
+    return target_program(program, 61 if arch < 80 else 80) + b"\0"

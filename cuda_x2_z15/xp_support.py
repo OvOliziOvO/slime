@@ -2,7 +2,7 @@
 import ctypes as c
 import numpy as np
 
-from .cuda_compile import cached_cubin
+from .cuda_compile import module_image
 from .x_phase import Driver, packed_row_bytes
 
 HEADER=".version 8.0\n.target sm_86\n.address_size 64\n"
@@ -221,7 +221,7 @@ SUPPORT=support_program()
 
 class ScanDriver(Driver):
     def module(self,program,names):
-        code=cached_cubin(program.encode() if isinstance(program,str) else program)
+        code=module_image(program, self.arch)
         data=c.create_string_buffer(code)
         mod=c.c_void_p()
         self.call("cuModuleLoadData",c.byref(mod),c.cast(data,c.c_void_p))

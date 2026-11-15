@@ -7,7 +7,7 @@ import statistics
 import sys
 
 import numpy as np
-from .cuda_compile import cached_cubin
+from .cuda_compile import module_image
 
 PERIOD = 1 << 17
 MASK48 = (1 << 48) - 1
@@ -347,12 +347,13 @@ class Driver:
         self.call("cuInit",c.c_uint(0))
         dev=c.c_int()
         self.call("cuDeviceGet",c.byref(dev),c.c_int(0))
-        if required_capability is not None:
-            major, minor = c.c_int(), c.c_int()
-            self.call("cuDeviceGetAttribute", c.byref(major), c.c_int(75), dev)
-            self.call("cuDeviceGetAttribute", c.byref(minor), c.c_int(76), dev)
-            if (major.value, minor.value) != required_capability:
-                raise UnsupportedDevice(f"CUDA device has SM {major.value}.{minor.value}")
+        major, minor = c.c_int(), c.c_int()
+        self.call("cuDeviceGetAttribute", c.byref(major), c.c_int(75), dev)
+        self.call("cuDeviceGetAttribute", c.byref(minor), c.c_int(76), dev)
+        self.capability = (major.value, minor.value)
+        self.arch = 10 * major.value + minor.value
+        if self.arch < 61 or (required_capability is not None and self.capability != required_capability):
+            raise UnsupportedDevice(f"CUDA device has SM {major.value}.{minor.value}")
         self.context=c.c_void_p()
         self.call("cuCtxCreate_v2",c.byref(self.context),c.c_uint(0),dev)
         self.modules=[]
@@ -364,7 +365,7 @@ class Driver:
             raise RuntimeError(f"{name} CUDA error {result}")
 
     def create(self,program):
-        cubin=c.create_string_buffer(cached_cubin(program))
+        cubin=c.create_string_buffer(module_image(program, self.arch))
         mod=c.c_void_p()
         fn=c.c_void_p()
         self.call("cuModuleLoadData",c.byref(mod),c.cast(cubin,c.c_void_p))
