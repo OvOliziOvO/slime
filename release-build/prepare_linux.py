@@ -41,3 +41,12 @@ for name in ("SlimeCore.cpp", "SlimeCoreGPU.cu"):
 shutil.copytree("gpu_noise", native / "gpu_noise")
 noise = native / "gpu_noise/MinecraftGPUNoise.cu"
 noise.write_text(noise.read_text(encoding="utf-8-sig").replace("__declspec(dllexport)", ""))
+
+# Remove literal newline escapes left at EOF by the Windows source export.
+for header in (native / "gpu_noise").rglob("*"):
+    if header.suffix not in (".h", ".cuh"):
+        continue
+    text = header.read_text(encoding="utf-8-sig").rstrip()
+    while text.endswith(r"\n"):
+        text = text[:-2].rstrip()
+    header.write_text(text + "\n")
