@@ -1,0 +1,57 @@
+name: SlimeFinder V1.2 Windows preview
+
+on:
+  push:
+    branches: [release/v1.2-preview]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: slimefinder-v1-2-preview
+
+jobs:
+  verify-and-release:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Assemble the verified release files
+        run: python release-build/assemble_release.py
+      - name: Verify the Windows GUI launches
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path release-build/dist/SlimeFinder_V1.2_Windows_x64.exe
+          $name = [IO.Path]::GetFileNameWithoutExtension($exe)
+          $launcher = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -PassThru
+          try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(45)
+            do {
+              $windows = Get-Process -Name $name -ErrorAction SilentlyContinue
+              if ($windows | Where-Object { $_.MainWindowTitle -match 'V1\.2' }) {
+                Write-Host 'Windows GUI V1.2 started'
+                return
+              }
+              Start-Sleep -Milliseconds 350
+            } while ([DateTime]::UtcNow -lt $deadline)
+            $crash = Join-Path (Split-Path $exe) 'crash.log'
+            if (Test-Path $crash) { Get-Content $crash }
+            throw 'The packaged GUI did not open on Windows.'
+          } finally {
+            Get-Process -Name $name -ErrorAction SilentlyContinue | Stop-Process -Force
+          }
+      - name: Publish Windows preview and CUDA source
+        shell: pwsh
+        run: |
+          gh release create V1.2-preview `
+            --repo $env:GITHUB_REPOSITORY `
+            --target 1bbcd79c3908276b9c317c4990540314e0d15146 `
+            --prerelease `
+            --title 'SlimeFinder V1.2 Preview · Windows x64' `
+            --notes-file release-build/V1.2-release-notes.md `
+            release-build/dist/SlimeFinder_V1.2_Windows_x64.exe `
+            release-build/dist/SlimeFinder_V1.2_CUDA_Source.zip `
+            release-build/dist/SHA256SUMS.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
